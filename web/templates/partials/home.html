@@ -1,0 +1,137 @@
+<!-- Home/Markets Partial -->
+<div class="space-y-6" hx-ext="ws" ws-connect="/ws">
+    <!-- Header with Bot Status -->
+    <div class="flex items-center justify-between mb-6">
+        <div>
+            <h1 class="text-2xl font-bold tracking-tight">Markets</h1>
+            <p class="text-slate-400 text-sm mt-1">Live Binance data • 50+ pairs</p>
+        </div>
+        <div class="flex items-center gap-3">
+            <div class="flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-800/50">
+                <span id="botStatusDot" class="status-dot disconnected"></span>
+                <span id="botStatusText" class="text-sm font-medium text-slate-300">Bot Stopped</span>
+            </div>
+            <div class="flex gap-2">
+                <button id="stopBtn" class="hidden btn-danger px-4 py-2 rounded-xl text-sm font-semibold" hx-post="/api/stop" hx-target="#content" hx-swap="outerHTML">Stop Bot</button>
+                <button id="startBtn" class="btn-primary px-4 py-2 rounded-xl font-semibold" hx-post="/api/start" hx-target="#content" hx-swap="outerHTML">Start Bot</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Portfolio Summary Cards -->
+    <div class="portfolio-summary" id="portfolioSummary">
+        <div class="summary-card">
+            <div class="summary-label">Total Value</div>
+            <div class="summary-value" id="totalValue">$0.00</div>
+        </div>
+        <div class="summary-card">
+            <div class="summary-label">Buying Power</div>
+            <div class="summary-value" id="buyingPower">$0.00</div>
+        </div>
+        <div class="summary-card">
+            <div class="summary-label">24h P&L</div>
+            <div class="summary-value" id="pnl24h">$0.00</div>
+        </div>
+        <div class="summary-card">
+            <div class="summary-label">Open Positions</div>
+            <div class="summary-value" id="openPositions">0</div>
+        </div>
+    </div>
+
+    <!-- Markets List -->
+    <div class="bg-slate-900/50 border border-slate-800 rounded-2xl p-4">
+        <div class="flex items-center justify-between mb-4">
+            <h2 class="text-lg font-semibold">Top Markets</h2>
+            <div class="flex items-center gap-2">
+                <span class="status-dot connected"></span>
+                <span class="text-xs text-emerald-400">Live</span>
+            </div>
+        </div>
+        <div class="space-y-3" id="marketsList">
+            <!-- Markets loaded via JS -->
+        </div>
+    </div>
+</div>
+
+<script>
+    // Load markets on load
+    async function loadMarkets() {
+        try {
+            const res = await fetch('/api/markets', {headers: getAuthHeaders()});
+            const data = await res.json();
+            renderMarkets(data.markets);
+            loadPortfolioSummary();
+        } catch (e) {
+            console.error('Markets load error:', e);
+        }
+    }
+    
+    async function loadPortfolioSummary() {
+        try {
+            const res = await fetch('/api/account', {headers: getAuthHeaders()});
+            const acct = await res.json();
+            document.getElementById('totalValue').textContent = '$' + (acct.portfolio_value || 0).toLocaleString(undefined, {minimumFractionDigits: 2});
+            document.getElementById('buyingPower').textContent = '$' + (acct.buying_power || 0).toLocaleString(undefined, {minimumFractionDigits: 2});
+            
+            const pos = await fetch('/api/positions', {headers: getAuthHeaders()});
+            const positions = await pos.json();
+            document.getElementById('openPositions').textContent = positions.length;
+            
+            // Calculate 24h P&L
+            const pnl = positions.reduce((sum, p) => sum + (parseFloat(p.unrealized_pl) || 0), 0);
+            const pnlEl = document.getElementById('pnl24h');
+            pnlEl.textContent = '$' + pnl.toLocaleString(undefined, {minimumFractionDigits: 2});
+            pnlEl.className = 'summary-value ' + (pnl >= 0 ? 'positive' : 'negative');
+        } catch (e) {
+            console.error('Portfolio load error:', e);
+        }
+    }
+    
+    function renderMarkets(markets) {
+        const container = document.getElementById('marketsList');
+        if (!markets.length) {
+            container.innerHTML = '<div class="empty-state"><svg class="empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 12V7H5v5"/><path d="M21 12V7H5v5a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-5"/><path d="M10 7v10"/><path d="M14 7v4"/><path d="M18 7v10"/></svg><p>No markets found</p></div>';
+            return;
+        }
+        
+        container.innerHTML = markets.slice(0, 50).map(m => {
+            const cls = m.change_24h >= 0 ? 'positive' : 'negative';
+            const changeIcon = m.change_24h >= 0 ? '↑' : '↓';
+            return `
+                <a href="/market/${m.symbol}" class="coin-card" hx-get="/partial/market/${m.symbol}" hx-target="#content" hx-push-url="true" hx-swap="innerHTML">
+                    <div class="coin-header">
+                        <div class="coin-icon">${m.symbol.replace('USDT', '').slice(0, 3)}</div>
+                        <div class="coin-info">
+                            <div class="coin-symbol">${m.symbol.replace('USDT', '')}</div>
+                            <div class="coin-name">/USDT</div>
+                        </div>
+                        <div class="coin-price">
+                            <div class="price-main" id="price-${m.symbol}">${formatPrice(m.price)}</div>
+                            <div class="price-change ${m.change_24h >= 0 ? 'positive' : 'negative'}" id="change-${m.symbol}">
+                                ${m.change_24h >= 0 ? '↑' : '↓'} ${formatPct(m.change_24h)}
+                            </div>
+                        </div>
+                    </div>
+                    <div class="coin-stats">
+                        <div class="stat">
+                            <div class="stat-label">24h Volume</div>
+                            <div class="stat-value">${formatNumber(m.volume)}</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-label">24h High</div>
+                            <div class="stat-value">${formatPrice(m.high)}</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-label">24h Low</div>
+                            <div class="stat-value">${formatPrice(m.low)}</div>
+                        </div>
+                    </div>
+                </a>
+            `;
+        }).join('');
+    }
+    
+    // Load on mount
+    loadMarkets();
+    setInterval(loadMarkets, 30000); // Refresh every 30s
+</script>

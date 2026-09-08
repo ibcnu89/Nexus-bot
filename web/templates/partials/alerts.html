@@ -1,0 +1,388 @@
+<!-- Alerts Partial - Real-time FOMO alerts integration -->
+<div class="space-y-6">
+    <div class="flex items-center justify-between">
+        <h1 class="text-2xl font-bold tracking-tight">Alerts</h1>
+        <div class="flex items-center gap-3">
+            <button id="fomoToggle" class="btn-secondary px-4 py-2 rounded-xl text-sm font-semibold flex items-center gap-2">
+                <span id="fomoStatusDot" class="w-2 h-2 rounded-full bg-red-500"></span>
+                <span id="fomoStatusText">FOMO: Disconnected</span>
+            </button>
+            <button class="btn-primary px-4 py-2 rounded-xl text-sm font-semibold" hx-get="/partial/alerts/create" hx-target="#content" hx-push-url="true" hx-swap="innerHTML">
+                <svg class="w-4 h-4 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
+                Create Alert
+            </button>
+        </div>
+    </div>
+
+    <!-- FOMO Connection Status -->
+    <div id="fomoBanner" class="hidden p-3 bg-slate-800/50 border border-slate-700 rounded-xl text-sm">
+        <div class="flex items-center justify-between">
+            <div class="flex items-center gap-2">
+                <span id="fomoBannerDot" class="w-2 h-2 rounded-full bg-amber-500 animate-pulse"></span>
+                <span id="fomoBannerText">Connecting to FOMO alerts...</span>
+            </div>
+            <button onclick="document.getElementById('fomoBanner').classList.add('hidden')" class="p-1 hover:bg-slate-700 rounded">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+            </button>
+        </div>
+    </div>
+
+    <!-- Live FOMO Alerts Feed -->
+    <div class="bg-slate-900/50 border border-slate-800 rounded-2xl p-4">
+        <div class="flex items-center justify-between mb-4">
+            <h2 class="text-lg font-semibold flex items-center gap-2">
+                <svg class="w-5 h-5 text-amber-500" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-1.917 1.917a12.061 12.061 0 015.048 5.048l-4.147 4.147a12.06 12.06 0 01-5.048 5.048l-1.923 1.923H4.26a16.581 16.581 0 01-4.894-3.275 1 1 0 011.414-1.414 14.58 14.58 0 005.707 5.707l3.466 3.466a1 1 0 001.414-1.414l-3.477-3.477a14.58 14.58 0 001.341-5.123l.109-.325a16.59 16.59 0 003.3-4.938 1 1 0 011.414 1.414c0 4.556-2.87 8.468-7 9.813v.228l1.787 1.787a1 1 0 010 1.414l-1.5 1.5a1 1 0 01-1.414 0L4.258 16.184a1 1 0 010-1.414l1.758-1.758v-.226A30.6 30.6 0 011.5 12c0-4.086 1.796-8.082 4.756-10.75z"/></svg>
+                Live FOMO Feed
+            </h2>
+            <button id="clearAlerts" class="text-sm text-slate-400 hover:text-slate-300">Clear</button>
+        </div>
+        <div class="space-y-2 max-h-96 overflow-y-auto" id="fomoAlerts">
+            <div class="empty-state" id="emptyAlerts">
+                <svg class="empty-icon mx-auto text-slate-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+                    <path d="M18.244 2.25h3.308l-1.917 1.917a12.061 12.061 0 015.048 5.048l-4.147 4.147a12.06 12.06 0 01-5.048 5.048l-1.923 1.923H4.26a16.581 16.581 0 01-4.894-3.275 1 1 0 011.414-1.414 14.58 14.58 0 005.707 5.707l3.466 3.466a1 1 0 001.414-1.414l-3.477-3.477a14.58 14.58 0 001.341-5.123l.109-.325a16.59 16.59 0 003.3-4.938 1 1 0 011.414 1.414c0 4.556-2.87 8.468-7 9.813v.228l1.787 1.787a1 1 0 010 1.414l-1.5 1.5a1 1 0 01-1.414 0L4.258 16.184a1 1 0 010-1.414l1.758-1.758v-.226A30.6 30.6 0 011.5 12c0-4.086 1.796-8.082 4.756-10.75z"/>
+                </svg>
+                <p>Waiting for FOMO alerts...</p>
+                <p class="text-xs mt-1">Connect to see live trader activity</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Active Alerts (User-created) -->
+    <div class="bg-slate-900/50 border border-slate-800 rounded-2xl p-4">
+        <h2 class="text-lg font-semibold mb-4 flex items-center gap-2">
+            <svg class="w-5 h-5 text-blue-400" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
+            Active Alerts
+        </h2>
+        <div class="space-y-3" id="activeAlerts">
+            <div class="empty-state">
+                <svg class="empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+                    <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/>
+                </svg>
+                <p>No active alerts</p>
+                <p class="text-xs mt-1">Create your first price alert</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Alert History -->
+    <div class="bg-slate-900/50 border border-slate-800 rounded-2xl p-4">
+        <div class="flex items-center justify-between mb-4">
+            <h2 class="text-lg font-semibold">Alert History</h2>
+            <button class="text-sm text-emerald-400 hover:text-emerald-300">View All</button>
+        </div>
+        <div class="space-y-3" id="alertHistory">
+            <div class="empty-state">
+                <svg class="empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+                    <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/>
+                </svg>
+                <p>No alert history yet</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Price Alert Templates -->
+    <div class="bg-slate-900/50 border border-slate-800 rounded-2xl p-4">
+        <h2 class="text-lg font-semibold mb-4">Quick Alerts</h2>
+        <p class="text-sm text-slate-400 mb-4">Set up common alert types quickly</p>
+        <div class="grid grid-cols-2 gap-3">
+            <button class="btn-secondary px-4 py-3 rounded-xl text-left" hx-get="/partial/alerts/create?type=price_drop" hx-target="#content" hx-push-url="true" hx-swap="innerHTML">
+                <div class="font-semibold">Price Drop Alert</div>
+                <div class="text-xs text-slate-400">Notify when a coin drops X%</div>
+            </button>
+            <button class="btn-secondary px-4 py-3 rounded-xl text-left" hx-get="/partial/alerts/create?type=price_rise" hx-target="#content" hx-push-url="true" hx-swap="innerHTML">
+                <div class="font-semibold">Price Rise Alert</div>
+                <div class="text-xs text-slate-400">Notify when a coin rises X%</div>
+            </button>
+            <button class="btn-secondary px-4 py-3 rounded-xl text-left" hx-get="/partial/alerts/create?type=volume_spike" hx-target="#content" hx-push-url="true" hx-swap="innerHTML">
+                <div class="font-semibold">Volume Spike</div>
+                <div class="text-xs text-slate-400">Notify on unusual volume</div>
+            </button>
+            <button class="btn-secondary px-4 py-3 rounded-xl text-left" hx-get="/partial/alerts/create?type=portfolio_pnl" hx-target="#content" hx-push-url="true" hx-swap="innerHTML">
+                <div class="font-semibold">Portfolio P&L</div>
+                <div class="text-xs text-slate-400">Alert on total P&L change</div>
+            </button>
+        </div>
+    </div>
+</div>
+
+<script>
+    let fomoWsConnected = false;
+    let alertCount = 0;
+    const MAX_ALERTS = 100;
+
+    // Format currency
+    function formatCurrency(val) {
+        if (val >= 1e9) return '$' + (val / 1e9).toFixed(2) + 'B';
+        if (val >= 1e6) return '$' + (val / 1e6).toFixed(2) + 'M';
+        if (val >= 1e3) return '$' + (val / 1e3).toFixed(2) + 'K';
+        return '$' + val.toFixed(2);
+    }
+
+    // Format time
+    function formatTime(isoString) {
+        try {
+            const date = new Date(isoString);
+            return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        } catch {
+            return 'N/A';
+        }
+    }
+
+    // Get auth headers
+    function getAuthHeaders() {
+        const token = document.cookie.split('; ').find(row => row.startsWith('access_token='));
+        if (token) {
+            return { 'Authorization': 'Bearer ' + token.split('=')[1] };
+        }
+        return {};
+    }
+
+    // Update FOMO connection status
+    function updateFomoStatus(connected, error = null) {
+        const statusDot = document.getElementById('fomoStatusDot');
+        const statusText = document.getElementById('fomoStatusText');
+        const banner = document.getElementById('fomoBanner');
+        const bannerDot = document.getElementById('fomoBannerDot');
+        const bannerText = document.getElementById('fomoBannerText');
+
+        if (connected) {
+            fomoWsConnected = true;
+            statusDot.className = 'w-2 h-2 rounded-full bg-emerald-500';
+            statusText.textContent = 'FOMO: Live';
+            banner.classList.add('hidden');
+        } else {
+            fomoWsConnected = false;
+            statusDot.className = 'w-2 h-2 rounded-full bg-red-500';
+            statusText.textContent = 'FOMO: Disconnected';
+            
+            if (error) {
+                banner.classList.remove('hidden');
+                bannerDot.className = 'w-2 h-2 rounded-full bg-red-500';
+                bannerText.textContent = 'FOMO connection error: ' + error;
+            } else {
+                banner.classList.remove('hidden');
+                bannerDot.className = 'w-2 h-2 rounded-full bg-amber-500 animate-pulse';
+                bannerText.textContent = 'Reconnecting to FOMO...';
+            }
+        }
+    }
+
+    // Add FOMO alert to UI
+    function addFomoAlert(alert) {
+        const container = document.getElementById('fomoAlerts');
+        const emptyState = document.getElementById('emptyAlerts');
+        
+        // Hide empty state
+        if (emptyState) emptyState.style.display = 'none';
+
+        // Create alert element using safe DOM methods
+        const alertEl = document.createElement('div');
+        alertEl.className = 'p-3 bg-slate-800/50 rounded-xl border-l-4 border-amber-500 animate-slide-in';
+        
+        const time = formatTime(alert.timestamp);
+        const typeIcon = getTypeIcon(alert.type);
+        const typeColor = getTypeColor(alert.type);
+        const actionColor = alert.action === 'buy' ? 'text-emerald-400' : 'text-red-400';
+        
+        // Create inner elements safely
+        const wrapper = document.createElement('div');
+        wrapper.className = 'flex items-start justify-between gap-2';
+        
+        const leftDiv = document.createElement('div');
+        leftDiv.className = 'flex-1 min-w-0';
+        
+        const headerDiv = document.createElement('div');
+        headerDiv.className = 'flex items-center gap-2';
+        
+        const iconSpan = document.createElement('span');
+        iconSpan.className = typeColor;
+        iconSpan.textContent = typeIcon;
+        
+        const traderSpan = document.createElement('span');
+        traderSpan.className = 'font-semibold text-sm';
+        traderSpan.textContent = alert.trader;
+        
+        const actionSpan = document.createElement('span');
+        actionSpan.className = `px-2 py-0.5 text-xs rounded-full ${actionColor} bg-opacity-20`;
+        actionSpan.textContent = alert.action.toUpperCase();
+        
+        const timeSpan = document.createElement('span');
+        timeSpan.className = 'text-xs text-slate-500';
+        timeSpan.textContent = time;
+        
+        headerDiv.append(iconSpan, traderSpan, actionSpan, timeSpan);
+        leftDiv.appendChild(headerDiv);
+        
+        // Add details
+        if (alert.token_symbol || alert.chain || alert.thesis || alert.value_usd > 0) {
+            const detailsDiv = document.createElement('div');
+            detailsDiv.className = 'mt-2';
+            
+            if (alert.token_symbol) {
+                const tokenDiv = document.createElement('div');
+                tokenDiv.className = 'flex items-center gap-2 text-sm';
+                
+                const tokenSymbol = document.createElement('span');
+                tokenSymbol.className = 'font-mono text-xs bg-slate-700 px-2 py-0.5 rounded';
+                tokenSymbol.textContent = alert.token_symbol;
+                
+                tokenDiv.appendChild(tokenSymbol);
+                
+                if (alert.chain) {
+                    const chainSpan = document.createElement('span');
+                    chainSpan.className = 'text-xs text-slate-400';
+                    chainSpan.textContent = alert.chain;
+                    tokenDiv.appendChild(chainSpan);
+                }
+                
+                detailsDiv.appendChild(tokenDiv);
+            }
+            
+            if (alert.thesis) {
+                const thesisDiv = document.createElement('div');
+                thesisDiv.className = 'text-xs text-slate-300 mt-1 italic';
+                thesisDiv.textContent = `"${alert.thesis.slice(0, 100)}${alert.thesis.length > 100 ? '...' : ''}"`;
+                detailsDiv.appendChild(thesisDiv);
+            }
+            
+            if (alert.value_usd > 0) {
+                const valueDiv = document.createElement('div');
+                valueDiv.className = 'text-xs text-emerald-400';
+                valueDiv.textContent = `Value: ${formatCurrency(alert.value_usd)}`;
+                detailsDiv.appendChild(valueDiv);
+            }
+            
+            leftDiv.appendChild(detailsDiv);
+        }
+        
+        wrapper.appendChild(leftDiv);
+        alertEl.appendChild(wrapper);
+
+        // Insert at top
+        container.insertBefore(alertEl, container.firstChild);
+
+        // Limit number of alerts
+        const alerts = container.querySelectorAll('[class*="animate-slide-in"]');
+        if (alerts.length > MAX_ALERTS) {
+            alerts[alerts.length - 1].remove();
+        }
+
+        alertCount++;
+    }
+
+    function getTypeIcon(type) {
+        const icons = {
+            'trade': '💹',
+            'buy': '🟢',
+            'sell': '🔴',
+            'thesis': '📝',
+            'whale': '🐋',
+            'price': '📊',
+            'follow': '👥'
+        };
+        return icons[type] || '📌';
+    }
+
+    function getTypeColor(type) {
+        const colors = {
+            'trade': 'text-amber-400',
+            'buy': 'text-emerald-400',
+            'sell': 'text-red-400',
+            'thesis': 'text-blue-400',
+            'whale': 'text-purple-400',
+            'price': 'text-cyan-400',
+            'follow': 'text-pink-400'
+        };
+        return colors[type] || 'text-slate-400';
+    }
+
+    // Clear alerts
+    document.getElementById('clearAlerts')?.addEventListener('click', () => {
+        const container = document.getElementById('fomoAlerts');
+        const emptyState = document.getElementById('emptyAlerts');
+        container.innerHTML = '';
+        if (emptyState) emptyState.style.display = 'block';
+        alertCount = 0;
+    });
+
+    // Subscribe to FOMO alerts
+    function subscribeFomoAlerts() {
+        if (window.ws && window.ws.readyState === WebSocket.OPEN) {
+            window.ws.send(JSON.stringify({ type: 'fomo_subscribe' }));
+        }
+    }
+
+    function unsubscribeFomoAlerts() {
+        if (window.ws && window.ws.readyState === WebSocket.OPEN) {
+            window.ws.send(JSON.stringify({ type: 'fomo_unsubscribe' }));
+        }
+    }
+
+    // Check FOMO WebSocket status
+    async function checkFomoWsStatus() {
+        try {
+            const res = await fetch('/api/fomo/ws/status', { headers: getAuthHeaders() });
+            const data = await res.json();
+            updateFomoStatus(data.connected && data.ws_task_running);
+        } catch (e) {
+            updateFomoStatus(false, e.message);
+        }
+    }
+
+    // Initialize
+    document.addEventListener('DOMContentLoaded', () => {
+        // Hook into existing WebSocket connection
+        const originalWs = window.ws;
+        
+        // Check FOMO status periodically
+        checkFomoWsStatus();
+        setInterval(checkFomoWsStatus, 30000);
+
+        // Subscribe to FOMO alerts
+        subscribeFomoAlerts();
+
+        // Listen for FOMO messages from the main WebSocket
+        const wsObserver = new MutationObserver(() => {});
+        
+        // The main WebSocket handler in index.html needs to forward fomo_alert messages
+        // We'll patch the message handler
+        const originalOnMessage = window.onmessage;
+        
+        // Check if we're in an iframe or have access to parent ws
+        if (typeof window.parent !== 'undefined' && window.parent.ws) {
+            window.ws = window.parent.ws;
+        }
+    });
+
+    // Patch the main WebSocket message handler for FOMO alerts
+    // This will be called from index.html's WebSocket handler
+    window.handleFomoMessage = function(msg) {
+        if (msg.type === 'fomo_alert' && msg.data) {
+            addFomoAlert(msg.data);
+        } else if (msg.type === 'fomo_status') {
+            updateFomoStatus(msg.data.connected, msg.data.error);
+        }
+    };
+
+    // Cleanup
+    window.addEventListener('beforeunload', () => {
+        unsubscribeFomoAlerts();
+    });
+</script>
+
+<style>
+    @keyframes slide-in {
+        from { opacity: 0; transform: translateX(-10px); }
+        to { opacity: 1; transform: translateX(0); }
+    }
+    .animate-slide-in {
+        animation: slide-in 0.3s ease-out;
+    }
+    .animate-pulse {
+        animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.5; }
+    }
+</style>

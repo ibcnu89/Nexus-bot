@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="theme-color" content="#0a0f1a">
+    <title>Login - PowerTrader AI</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        :root {
+            --bg: #0a0f1a;
+            --bg-elevated: #111827;
+            --card: #161e2e;
+            --border: #1f2937;
+            --text: #f1f5f9;
+            --text-muted: #94a3b8;
+            --accent: #10b981;
+            --accent-dim: #059669;
+        }
+        * { box-sizing: border-box; }
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Roboto, sans-serif;
+            -webkit-font-smoothing: antialiased;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+        }
+        .input-field {
+            width: 100%;
+            padding: 16px 16px;
+            border-radius: 12px;
+            background: #111827;
+            border: 1px solid #1f2937;
+            color: #f1f5f9;
+            font-size: 16px;
+            transition: all 0.2s;
+        }
+        .input-field:focus {
+            outline: none;
+            border-color: #10b981;
+            box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.2);
+        }
+        .btn-primary {
+            width: 100%;
+            padding: 16px;
+            border-radius: 12px;
+            font-size: 16px;
+            font-weight: 600;
+            background: #10b981;
+            color: white;
+            border: none;
+            transition: all 0.2s;
+        }
+        .btn-primary:hover {
+            background: #059669;
+        }
+        .btn-primary:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+    </style>
+</head>
+<body>
+    <div class="w-full max-w-md">
+        <div class="text-center mb-10">
+            <div class="w-20 h-20 mx-auto mb-6 rounded-2xl bg-gradient-to-br from-emerald-500 to-blue-600 flex items-center justify-center">
+                <svg class="w-10 h-10 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"/>
+                </svg>
+            </div>
+            <h1 class="text-3xl font-bold tracking-tight">PowerTrader AI</h1>
+            <p class="text-slate-400 mt-2">Sign in to access your trading bot</p>
+        </div>
+        
+        <form id="loginForm" class="space-y-5" hx-post="/api/login" hx-target="#loginResult" hx-swap="innerHTML">
+            <div>
+                <label class="block text-sm font-medium text-slate-300 mb-2">Username</label>
+                <input type="text" name="username" value="admin" required
+                    class="input-field"
+                    autocomplete="username"
+                    autofocus>
+            </div>
+            <div>
+                <label class="block text-sm font-medium text-slate-300 mb-2">Password</label>
+                <input type="password" name="password" required
+                    class="input-field"
+                    autocomplete="current-password">
+            </div>
+            <button type="submit" class="btn-primary" id="submitBtn">
+                <span id="btnText">Sign In</span>
+                <span id="btnLoader" class="hidden inline-flex items-center justify-center">
+                    <svg class="animate-spin -ml-1 mr-2 h-5 w-5 text-white" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                </span>
+            </button>
+        </form>
+        
+        <div id="loginResult" class="mt-6"></div>
+        
+        <div class="mt-8 text-center text-sm text-slate-500">
+            <p>PowerTrader AI • Binance + Alpaca</p>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        // Handle login form
+        document.getElementById('loginForm')?.addEventListener('htmx:afterRequest', function(evt) {
+            if (evt.detail.successful) {
+                // Store token in cookie via response header
+                window.location.href = '/';
+            } else {
+                const result = evt.detail.target;
+                if (result && result.innerHTML.includes('Incorrect')) {
+                    result.innerHTML = '<div class="p-4 bg-red-900/30 border border-red-700 rounded-xl text-red-300 text-sm">Incorrect username or password</div>';
+                }
+            }
+        });
+        
+        // Disable button during submit
+        document.getElementById('loginForm')?.addEventListener('htmx:beforeRequest', function() {
+            document.getElementById('submitBtn').disabled = true;
+            document.getElementById('btnText').classList.add('hidden');
+            document.getElementById('btnLoader').classList.remove('hidden');
+        });
+        
+        document.getElementById('loginForm')?.addEventListener('htmx:afterRequest', function() {
+            document.getElementById('submitBtn').disabled = false;
+            document.getElementById('btnText').classList.remove('hidden');
+            document.getElementById('btnLoader').classList.add('hidden');
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,65 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Environment & Secrets
+.env
+.env.local
+*.env
+alpaca_key.txt
+alpaca_secret.txt
+fomo_key.txt
+web_user.json
+
+# IDE/Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+
+# Test coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Local data directories
+BNB/
+DOGE/
+ETH/
+PAXG/
+SOL/
+XRP/
+hub_data/
+*.txt
+!requirements.txt
+!README.md
+!LICENSE
+
+# GUI settings (contains user preferences)
+gui_settings.json
+trainer_status.json
+alerts_version.txt
+futures_long_onoff.txt
+futures_long_profit_margin.txt
+futures_short_onoff.txt
+futures_short_profit_margin.txt
+long_dca_signal.txt
+short_dca_signal.txt

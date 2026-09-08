@@ -1,0 +1,161 @@
+<!-- Dashboard Partial -->
+<div class="space-y-6">
+    <!-- Status Bar -->
+    <div class="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4 bg-slate-900 border border-slate-800 rounded-xl p-4">
+        <div class="flex items-center gap-4">
+            <div class="w-3 h-3 rounded-full status-stopped" id="dashStatusDot"></div>
+            <div>
+                <p class="text-lg font-medium" id="dashStatusText">Bot Stopped</p>
+                <p class="text-sm text-slate-400" id="dashStatusDetail">Click Start to begin trading</p>
+            </div>
+        </div>
+        <div class="flex gap-3">
+            <button id="startBtn" hx-post="/api/start" hx-target="#dashStatusText" hx-swap="innerHTML" 
+                class="px-6 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-medium rounded-lg transition-colors disabled:opacity-50">
+                Start Bot
+            </button>
+            <button id="stopBtn" hx-post="/api/stop" hx-target="#dashStatusText" hx-swap="innerHTML"
+                class="px-6 py-2 bg-red-600 hover:bg-red-500 text-white font-medium rounded-lg transition-colors hidden">
+                Stop Bot
+            </button>
+        </div>
+    </div>
+
+    <!-- Account Summary -->
+    <div class="grid grid-cols-2 lg:grid-cols-4 gap-4" id="accountCards">
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+            <p class="text-slate-400 text-sm">Buying Power</p>
+            <p class="text-2xl font-bold text-emerald-400" id="buyingPower">$0.00</p>
+        </div>
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+            <p class="text-slate-400 text-sm">Portfolio Value</p>
+            <p class="text-2xl font-bold text-white" id="portfolioValue">$0.00</p>
+        </div>
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+            <p class="text-slate-400 text-sm">Open Positions</p>
+            <p class="text-2xl font-bold text-blue-400" id="openPositions">0</p>
+        </div>
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+            <p class="text-slate-400 text-sm">Alpaca</p>
+            <p class="text-sm" id="alpacaStatus">
+                <span class="inline-flex items-center gap-1.5">
+                    <span class="w-2 h-2 rounded-full bg-red-500"></span>
+                    Disconnected
+                </span>
+            </p>
+        </div>
+    </div>
+
+    <!-- Live Prices -->
+    <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+        <h3 class="text-lg font-medium mb-4">Live Prices</h3>
+        <div class="grid grid-cols-2 lg:grid-cols-5 gap-3" id="priceGrid">
+            <!-- Prices loaded via JS -->
+        </div>
+    </div>
+
+    <!-- Positions Table -->
+    <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+        <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
+            <h3 class="text-lg font-medium">Open Positions</h3>
+            <button hx-get="/api/positions" hx-target="#positionsTable" hx-swap="innerHTML" 
+                class="text-sm text-emerald-400 hover:text-emerald-300">Refresh</button>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="w-full" id="positionsTable">
+                <thead class="bg-slate-800/50">
+                    <tr class="text-left text-sm text-slate-400">
+                        <th class="px-4 py-2">Symbol</th>
+                        <th class="px-4 py-2">Qty</th>
+                        <th class="px-4 py-2">Avg Entry</th>
+                        <th class="px-4 py-2">Current</th>
+                        <th class="px-4 py-2">P&L</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-800">
+                    <tr><td colspan="5" class="px-4 py-8 text-center text-slate-500">Loading...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Recent Orders -->
+    <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+        <div class="px-4 py-3 border-b border-slate-800">
+            <h3 class="text-lg font-medium">Recent Activity</h3>
+        </div>
+        <div class="p-4 space-y-3" id="recentOrders">
+            <p class="text-slate-500 text-center py-8">No recent orders</p>
+        </div>
+    </div>
+</div>
+
+<script>
+    // Load dashboard data
+    async function loadDashboard() {
+        try {
+            // Account
+            const acct = await fetch('/api/account', {headers: authHeaders()}).then(r => r.json());
+            document.getElementById('buyingPower').textContent = '$' + (acct.buying_power || 0).toLocaleString(undefined, {minimumFractionDigits: 2});
+            document.getElementById('portfolioValue').textContent = '$' + (acct.portfolio_value || 0).toLocaleString(undefined, {minimumFractionDigits: 2});
+            
+            // Positions
+            const pos = await fetch('/api/positions', {headers: authHeaders()}).then(r => r.json());
+            document.getElementById('openPositions').textContent = pos.length;
+            renderPositions(pos);
+            
+            // Alpaca status
+            const alpaca = await fetch('/api/alpaca/status', {headers: authHeaders()}).then(r => r.json());
+            const alpacaEl = document.getElementById('alpacaStatus');
+            if (alpaca.connected) {
+                alpacaEl.innerHTML = `<span class="inline-flex items-center gap-1.5 text-emerald-400"><span class="w-2 h-2 rounded-full bg-emerald-500"></span> Connected (${alpaca.account})</span>`;
+            } else if (alpaca.configured) {
+                alpacaEl.innerHTML = `<span class="inline-flex items-center gap-1.5 text-yellow-400"><span class="w-2 h-2 rounded-full bg-yellow-500"></span> Configured but not connected</span>`;
+            } else {
+                alpacaEl.innerHTML = `<span class="inline-flex items-center gap-1.5 text-red-400"><span class="w-2 h-2 rounded-full bg-red-500"></span> Not configured</span>`;
+            }
+        } catch (e) {
+            console.error('Dashboard load error:', e);
+        }
+    }
+
+    function renderPositions(positions) {
+        const tbody = document.querySelector('#positionsTable tbody');
+        if (!positions.length) {
+            tbody.innerHTML = '<tr><td colspan="5" class="px-4 py-8 text-center text-slate-500">No open positions</td></tr>';
+            return;
+        }
+        tbody.innerHTML = positions.map(p => `
+            <tr class="hover:bg-slate-800/50">
+                <td class="px-4 py-2 font-medium">${p.symbol}</td>
+                <td class="px-4 py-2">${parseFloat(p.qty).toFixed(6)}</td>
+                <td class="px-4 py-2">$${parseFloat(p.avg_entry_price).toLocaleString()}</td>
+                <td class="px-4 py-2">$${parseFloat(p.current_price).toLocaleString()}</td>
+                <td class="px-4 py-2 ${parseFloat(p.unrealized_pl) >= 0 ? 'text-emerald-400' : 'text-red-400'}">
+                    ${parseFloat(p.unrealized_pl).toLocaleString(undefined, {minimumFractionDigits: 2})} (${parseFloat(p.unrealized_plpc).toFixed(2)}%)
+                </td>
+            </tr>
+        `).join('');
+    }
+
+    function authHeaders() {
+        const token = document.cookie.split('; ').find(row => row.startsWith('access_token='));
+        return {'Authorization': token ? 'Bearer ' + token.split('=')[1] : ''};
+    }
+
+    // Initial load
+    loadDashboard();
+    setInterval(loadDashboard, 30000); // Refresh every 30s
+
+    // Price grid
+    const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'DOGE-USD', 'XRP-USD'];
+    const priceGrid = document.getElementById('priceGrid');
+    priceGrid.innerHTML = symbols.map(s => `
+        <div class="bg-slate-800/50 rounded-lg p-3 text-center">
+            <div class="text-xs text-slate-400">${s.replace('-USD','')}</div>
+            <div class="text-lg font-mono" id="price-${s}">Loading...</div>
+        </div>
+    `).join('');
+
+    // WebSocket price updates handled by global listener in index.html
+</script>

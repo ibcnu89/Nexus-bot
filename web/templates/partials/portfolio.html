@@ -1,0 +1,281 @@
+<!-- Portfolio Partial -->
+<div class="space-y-6">
+    <!-- Header -->
+    <div class="flex items-center justify-between">
+        <h1 class="text-2xl font-bold tracking-tight">Portfolio</h1>
+        <button class="refresh-btn" hx-get="/partial/portfolio" hx-target="#content" hx-swap="outerHTML">
+            <svg class="w-4 h-4 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.001 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+        </button>
+    </div>
+
+    <!-- Portfolio Summary -->
+    <div class="portfolio-summary">
+        <div class="summary-card">
+            <div class="summary-label">Total Value</div>
+            <div class="summary-value" id="totalValue">$0.00</div>
+        </div>
+        <div class="summary-card">
+            <div class="summary-label">Buying Power</div>
+            <div class="summary-value" id="buyingPower">$0.00</div>
+        </div>
+        <div class="summary-card">
+            <div class="summary-label">24h P&L</div>
+            <div class="summary-value" id="pnl24h">$0.00</div>
+        </div>
+        <div class="summary-card">
+            <div class="summary-label">24h Change</div>
+            <div class="summary-value" id="pnlPct24h">0.00%</div>
+        </div>
+    </div>
+
+    <!-- P&L Chart -->
+    <div class="chart-card">
+        <div class="chart-header">
+            <h3 class="chart-title">Portfolio Value (24h)</h3>
+            <div class="interval-selector" id="portfolioIntervals">
+                <button class="interval-btn active" data-interval="1m">1m</button>
+                <button class="interval-btn" data-interval="5m">5m</button>
+                <button class="interval-btn" data-interval="1h">1h</button>
+                <button class="interval-btn" data-interval="1d">1d</button>
+            </div>
+        </div>
+        <div class="chart-container">
+            <canvas id="portfolioChart"></canvas>
+        </div>
+    </div>
+
+    <!-- Positions -->
+    <div class="bg-slate-900/50 border border-slate-800 rounded-2xl overflow-hidden">
+        <div class="flex items-center justify-between p-4 border-b border-slate-800">
+            <h2 class="text-lg font-semibold">Open Positions</h2>
+            <button class="refresh-btn text-sm px-3 py-1.5" hx-get="/partial/portfolio" hx-target="#content" hx-swap="outerHTML">
+                <svg class="w-4 h-4 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.001 0 01-15.357-2m15.357 2H15"/></svg>
+            </button>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="positions-table" id="positionsTable">
+                <thead>
+                    <tr>
+                        <th>Symbol</th>
+                        <th class="text-right">Qty</th>
+                        <th class="text-right">Avg Entry</th>
+                        <th class="text-right">Current</th>
+                        <th class="text-right">P&L</th>
+                        <th class="text-right">24h %</th>
+                    </tr>
+                </thead>
+                <tbody id="positionsBody">
+                    <tr><td colspan="6" class="px-4 py-8 text-center text-slate-500">Loading positions...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<script>
+    // Portfolio Chart
+    let portfolioChart = null;
+    let portfolioHistory = [];
+
+    async function loadPortfolio() {
+        await Promise.all([loadPortfolioSummary(), loadPositions(), loadPortfolioHistory()]);
+        initIntervalButtons();
+    }
+
+    async function loadPortfolioSummary() {
+        try {
+            const res = await fetch('/api/account', {headers: getAuthHeaders()});
+            const acct = await res.json();
+            
+            document.getElementById('totalValue').textContent = '$' + (acct.portfolio_value || 0).toLocaleString(undefined, {minimumFractionDigits: 2});
+            document.getElementById('buyingPower').textContent = '$' + (acct.buying_power || 0).toLocaleString(undefined, {minimumFractionDigits: 2});
+            
+            const pos = await fetch('/api/positions', {headers: getAuthHeaders()});
+            const positions = await pos.json();
+            
+            const pnl = positions.reduce((sum, p) => sum + (parseFloat(p.unrealized_pl) || 0), 0);
+            const pnlPct = positions.reduce((sum, p) => sum + (parseFloat(p.unrealized_plpc) || 0), 0);
+            
+            document.getElementById('pnl24h').textContent = '$' + pnl.toLocaleString(undefined, {minimumFractionDigits: 2});
+            document.getElementById('pnl24h').className = 'summary-value ' + (pnl >= 0 ? 'positive' : 'negative');
+            document.getElementById('pnlPct24h').textContent = (pnlPct >= 0 ? '+' : '') + pnlPct.toFixed(2) + '%';
+            document.getElementById('pnlPct24h').className = 'summary-value ' + (pnlPct >= 0 ? 'positive' : 'negative');
+        } catch (e) {
+            console.error('Portfolio summary error:', e);
+        }
+    }
+
+    async function loadPositions() {
+        try {
+            const res = await fetch('/api/positions', {headers: getAuthHeaders()});
+            const positions = await res.json();
+            renderPositions(positions);
+        } catch (e) {
+            console.error('Positions load error:', e);
+        }
+    }
+
+    function renderPositions(positions) {
+        const tbody = document.getElementById('positionsBody');
+        if (!positions.length) {
+            tbody.innerHTML = '<tr><td colspan="6" class="px-4 py-8 text-center text-slate-500">No open positions</td></tr>';
+            return;
+        }
+        
+        tbody.innerHTML = positions.map(p => {
+            const pnl = parseFloat(p.unrealized_pl) || 0;
+            const pnlPct = parseFloat(p.unrealized_plpc) || 0;
+            const pnlClass = pnl >= 0 ? 'positive' : 'negative';
+            return `
+                <tr>
+                    <td><span class="pos-symbol">${p.symbol}</span></td>
+                    <td class="text-right font-mono">${parseFloat(p.qty).toFixed(6)}</td>
+                    <td class="text-right font-mono">$${parseFloat(p.avg_entry_price).toLocaleString(undefined, {minimumFractionDigits: 2})}</td>
+                    <td class="text-right font-mono" id="pos-${p.symbol}">$${parseFloat(p.current_price).toLocaleString(undefined, {minimumFractionDigits: 2})}</td>
+                    <td class="text-right pos-pnl ${pnlClass}">$${pnl.toLocaleString(undefined, {minimumFractionDigits: 2})}</td>
+                    <td class="text-right pos-pnl ${pnlClass}">${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%</td>
+                </tr>
+            `;
+        }).join('');
+    } catch (e) {
+        console.error('Positions render error:', e);
+    }
+
+    async function loadPortfolioHistory() {
+        // In a real app, this would come from a history endpoint
+        // For now, generate mock history from current prices
+        try {
+            // We'll simulate 24h history by polling current prices
+            // In production, you'd have a dedicated history endpoint
+            portfolioHistory = [];
+            for (let i = 24; i >= 0; i--) {
+                portfolioHistory.push({
+                    ts: Date.now() - i * 3600000,
+                    value: 0 // Will be filled from actual data
+                });
+            }
+            renderPortfolioChart();
+        } catch (e) {
+            console.error('History load error:', e);
+        }
+    }
+
+    function renderPortfolioChart() {
+        const ctx = document.getElementById('portfolioChart');
+        if (!ctx) return;
+
+        if (portfolioChart) {
+            portfolioChart.destroy();
+        }
+
+        // Get real portfolio value from account
+        let currentValue = 0;
+        try {
+            const res = await fetch('/api/account', {headers: getAuthHeaders()});
+            const acct = await res.json();
+            currentValue = acct.portfolio_value || 0;
+        } catch (e) {
+            currentValue = 10000; // fallback
+        }
+
+        // Generate mock 24h data points around current value
+        const labels = [];
+        const data = [];
+        const now = Date.now();
+        for (let i = 24; i >= 0; i--) {
+            const ts = now - i * 3600000;
+            labels.push(new Date(ts).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}));
+            // Simulate slight variation around current value
+            const variation = (Math.random() - 0.5) * 0.02; // ±1%
+            data.push(currentValue * (1 + variation));
+        }
+
+        portfolioChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: labels,
+                datasets: [{
+                    data: data,
+                    borderColor: '#10b981',
+                    backgroundColor: 'rgba(16, 185, 129, 0.1)',
+                    borderWidth: 2,
+                    fill: true,
+                    tension: 0.3,
+                    pointRadius: 0,
+                    pointHoverRadius: 4,
+                    pointHoverBackgroundColor: '#10b981',
+                    pointHoverBorderColor: '#fff',
+                    pointHoverBorderWidth: 2,
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                interaction: {
+                    intersect: false,
+                    mode: 'index',
+                },
+                plugins: {
+                    legend: { display: false },
+                    tooltip: {
+                        backgroundColor: '#161e2e',
+                        titleColor: '#fff',
+                        bodyColor: '#e2e8f0',
+                        borderColor: '#1f2937',
+                        borderWidth: 1,
+                        padding: 12,
+                        displayColors: false,
+                        callbacks: {
+                            label: function(context) {
+                                return '$' + context.parsed.y.toLocaleString(undefined, {minimumFractionDigits: 2});
+                            }
+                        }
+                    }
+                },
+                scales: {
+                    x: {
+                        grid: { display: false },
+                        ticks: { color: '#64748b', font: { size: 10 } },
+                    },
+                    y: {
+                        grid: { color: '#1f2937' },
+                        ticks: { 
+                            color: '#64748b', 
+                            font: { size: 10 },
+                            callback: function(value) {
+                                return '$' + value.toLocaleString();
+                            }
+                        },
+                    }
+                },
+                animation: { duration: 300 },
+            }
+        });
+    }
+
+    function initIntervalButtons() {
+        document.querySelectorAll('#portfolioIntervals .interval-btn').forEach(btn => {
+            btn.addEventListener('click', function() {
+                document.querySelectorAll('#portfolioIntervals .interval-btn').forEach(b => b.classList.remove('active'));
+                this.classList.add('active');
+                // In production, fetch different interval data
+                renderPortfolioChart();
+            });
+        });
+    }
+
+    // Update positions with live prices
+    window.addEventListener('pricesUpdate', function(e) {
+        if (!e.detail) return;
+        document.querySelectorAll('#positionsBody td[id^="pos-"]').forEach(td => {
+            const sym = td.id.replace('pos-', '');
+            if (e.detail[sym]) {
+                td.textContent = '$' + e.detail[sym].price.toLocaleString(undefined, {minimumFractionDigits: 2});
+            }
+        });
+    });
+
+    loadPortfolio();
+    setInterval(loadPortfolio, 30000); // Refresh every 30s
+</script>

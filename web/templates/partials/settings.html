@@ -1,0 +1,155 @@
+<!-- Settings Partial -->
+<div class="space-y-6">
+    <div class="flex items-center justify-between">
+        <h2 class="text-2xl font-bold">Settings</h2>
+        <button hx-post="/api/settings" hx-target="#saveResult" hx-include="#settingsForm" hx-swap="innerHTML"
+            class="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-medium rounded-lg transition-colors">
+            Save Settings
+        </button>
+    </div>
+    <div id="saveResult" class="hidden"></div>
+
+    <form id="settingsForm" class="space-y-6" hx-post="/api/settings" hx-target="#saveResult" hx-swap="innerHTML">
+        <!-- Coins -->
+        <fieldset class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+            <legend class="text-lg font-medium mb-4">Trading Coins</legend>
+            <div class="grid grid-cols-2 lg:grid-cols-4 gap-3" id="coinsGrid">
+                <!-- Populated by JS -->
+            </div>
+        </fieldset>
+
+        <!-- General Settings -->
+        <fieldset class="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-4">
+            <legend class="text-lg font-medium mb-4">General</legend>
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                <div>
+                    <label class="block text-sm text-slate-300 mb-1">Main Neural Dir</label>
+                    <input type="text" name="main_neural_dir" value="/home/ibcnu/PowerTraderAI" 
+                        class="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                </div>
+                <div>
+                    <label class="block text-sm text-slate-300 mb-1">Trade Start Level (1-7)</label>
+                    <input type="number" name="trade_start_level" min="1" max="7" value="3"
+                        class="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                </div>
+            </div>
+        </fieldset>
+
+        <!-- Allocation & DCA -->
+        <fieldset class="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-4">
+            <legend class="text-lg font-medium mb-4">Allocation & DCA</legend>
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                <div>
+                    <label class="block text-sm text-slate-300 mb-1">Start Allocation %</label>
+                    <input type="number" name="start_allocation_pct" step="0.1" min="0" max="100" value="0.5"
+                        class="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                </div>
+                <div>
+                    <label class="block text-sm text-slate-300 mb-1">DCA Multiplier</label>
+                    <input type="number" name="dca_multiplier" step="0.1" min="0" value="2.0"
+                        class="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                </div>
+                <div>
+                    <label class="block text-sm text-slate-300 mb-1">Max DCA Buys / 24h</label>
+                    <input type="number" name="max_dca_buys_per_24h" min="0" value="2"
+                        class="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline:none focus:ring-2 focus:ring-emerald-500">
+                </div>
+            </div>
+        </fieldset>
+
+        <!-- Trailing Profit Margin -->
+        <fieldset class="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-4">
+            <legend class="text-lg font-medium mb-4">Trailing Profit Margin</legend>
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                <div>
+                    <label class="block text-sm text-slate-300 mb-1">PM Start % (No DCA)</label>
+                    <input type="number" name="pm_start_pct_no_dca" step="0.1" min="0" value="5.0"
+                        class="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                </div>
+                <div>
+                    <label class="block text-sm text-slate-300 mb-1">PM Start % (With DCA)</label>
+                    <input type="number" name="pm_start_pct_with_dca" step="0.1" min="0" value="2.5"
+                        class="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline:none focus:ring-2 focus:ring-emerald-500">
+                </div>
+                <div>
+                    <label class="block text-sm text-slate-300 mb-1">Trailing Gap %</label>
+                    <input type="number" name="trailing_gap_pct" step="0.1" min="0" value="0.5"
+                        class="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                </div>
+            </div>
+        </fieldset>
+
+        <!-- Long-term Holdings -->
+        <fieldset class="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-4">
+            <legend class="text-lg font-medium mb-4">Long-term Holdings (Profit Allocation)</legend>
+            <div>
+                <label class="block text-sm text-slate-300 mb-1">LTH Profit Allocation %</label>
+                <input type="number" name="lth_profit_alloc_pct" step="0.1" min="0" max="100" value="0"
+                    class="w-full max-w-xs px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-emerald-500">
+            </div>
+            <div class="grid grid-cols-2 lg:grid-cols-4 gap-3" id="lthGrid">
+                <!-- Populated by JS -->
+            </div>
+        </fieldset>
+
+        <div id="saveResult"></div>
+    </form>
+</div>
+
+<script>
+    // Load current settings
+    async function loadSettings() {
+        try {
+            const res = await fetch('/api/settings', {headers: authHeaders()});
+            const settings = await res.json();
+            
+            // Coins checkboxes
+            const allCoins = ['BTC','ETH','BNB','PAXG','SOL','XRP','DOGE','ADA','MATIC','AVAX','LINK','DOT'];
+            const enabled = settings.coins || [];
+            document.getElementById('coinsGrid').innerHTML = allCoins.map(c => `
+                <label class="flex items-center gap-2 px-3 py-2 bg-slate-800/50 rounded-lg cursor-pointer hover:bg-slate-800">
+                    <input type="checkbox" name="coins" value="${c}" ${enabled.includes(c) ? 'checked' : ''}
+                        class="w-4 h-4 text-emerald-600 border-slate-600 rounded focus:ring-emerald-500">
+                    <span class="font-medium">${c}</span>
+                </label>
+            `).join('');
+            
+            // LTH checkboxes
+            document.getElementById('lthGrid').innerHTML = (settings.long_term_holdings || []).map(c => `
+                <label class="flex items-center gap-2 px-3 py-2 bg-slate-800/50 rounded-lg cursor-pointer hover:bg-slate-800">
+                    <input type="checkbox" name="long_term_holdings" value="${c}" checked
+                        class="w-4 h-4 text-emerald-600 border-slate-600 rounded focus:ring-emerald-500">
+                    <span class="font-medium">${c}</span>
+                </label>
+            `).join('');
+            
+            // Fill form values
+            const form = document.getElementById('settingsForm');
+            for (const [key, value] of Object.entries(settings)) {
+                if (key === 'coins' || key === 'long_term_holdings' || key === 'dca_levels') continue;
+                const input = form.querySelector(`[name="${key}"]`);
+                if (input && value !== undefined) {
+                    input.value = value;
+                }
+            }
+        } catch (e) {
+            console.error('Settings load error:', e);
+        }
+    }
+
+    function authHeaders() {
+        const token = document.cookie.split('; ').find(row => row.startsWith('access_token='));
+        return {'Authorization': token ? 'Bearer ' + token.split('=')[1] : ''};
+    }
+
+    // Show save result
+    document.body.addEventListener('htmx:afterSwap', function(evt) {
+        if (evt.detail.target.id === 'saveResult') {
+            const el = document.getElementById('saveResult');
+            el.classList.remove('hidden');
+            setTimeout(() => el.classList.add('hidden'), 3000);
+        }
+    });
+
+    loadSettings();
+</script>

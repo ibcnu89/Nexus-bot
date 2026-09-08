@@ -1,0 +1,137 @@
+<!-- Search/Discover Partial -->
+<div class="space-y-6">
+    <!-- Search Bar -->
+    <div class="relative">
+        <input 
+            type="search" 
+            id="searchInput" 
+            placeholder="Search coins, tokens..." 
+            class="input-field pl-12 pr-4 py-3 text-lg"
+            autocomplete="off"
+            hx-get="/api/markets/search"
+            hx-trigger="keyup changed delay:300ms"
+            hx-target="#searchResults"
+            hx-include="[name='q']"
+            name="q"
+        >
+        <svg class="absolute left-4 top-1/2 -translate-y-1/2 text-slate-500" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/>
+        </svg>
+    </div>
+
+    <!-- Trending Section -->
+    <div class="space-y-4">
+        <h2 class="text-lg font-semibold flex items-center gap-2">
+            <svg class="w-5 h-5 text-amber-500" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-1.917 1.917a12.061 12.061 0 015.048 5.048l-4.147 4.147a12.06 12.06 0 01-5.048 5.048l-1.923 1.923H4.26a16.581 16.581 0 01-4.894-3.275 1 1 0 011.414-1.414 14.58 14.58 0 005.707 5.707l3.466 3.466a1 1 0 001.414-1.414l-3.477-3.477a14.58 14.58 0 001.341-5.123l.109-.325a16.59 16.59 0 003.3-4.938 1 1 0 011.414 1.414c0 4.556-2.87 8.468-7 9.813v.228l1.787 1.787a1 1 0 010 1.414l-1.5 1.5a1 1 0 01-1.414 0L4.258 16.184a1 1 0 010-1.414l1.758-1.758v-.226A30.6 30.6 0 011.5 12c0-4.086 1.796-8.082 4.756-10.75z"/></svg>
+            <span class="text-lg font-semibold">Trending Now</span>
+        </h2>
+        <div class="space-y-2" id="trendingList">
+            <!-- Loaded via JS -->
+        </div>
+    </div>
+
+    <!-- All Coins List -->
+    <div>
+        <h2 class="text-lg font-semibold mb-4">All Markets</h2>
+        <div class="space-y-2" id="allCoinsList">
+            <!-- Loaded via JS -->
+        </div>
+    </div>
+</div>
+
+<script>
+    async function loadSearchPage() {
+        loadAllCoins();
+        loadTrending();
+    }
+    
+    async function loadAllCoins() {
+        try {
+            const res = await fetch('/api/markets', {headers: getAuthHeaders()});
+            const data = await res.json();
+            renderAllCoins(data.markets);
+        } catch (e) {
+            console.error('All coins load error:', e);
+        }
+    }
+    
+    async function loadTrending() {
+        try {
+            const res = await fetch('/api/markets', {headers: getAuthHeaders()});
+            const data = await res.json();
+            // Sort by 24h change
+            const trending = data.markets
+                .filter(m => m.change_24h > 0)
+                .sort((a, b) => b.change_24h - a.change_24h)
+                .slice(0, 10);
+            renderTrending(trending);
+        } catch (e) {
+            console.error('Trending load error:', e);
+        }
+    }
+    
+    function renderTrending(coins) {
+        const container = document.getElementById('trendingList');
+        container.innerHTML = coins.map((m, i) => `
+            <a href="/market/${m.symbol}" class="coin-card" hx-get="/partial/market/${m.symbol}" hx-target="#content" hx-push-url="true" hx-swap="innerHTML">
+                <div class="flex items-center gap-4">
+                    <span class="w-8 h-8 rounded-lg bg-slate-800/50 flex items-center justify-center text-sm font-bold text-amber-500">${i + 1}</span>
+                    <div class="flex-1 min-w-0">
+                        <div class="font-semibold">${m.symbol.replace('USDT', '')}</div>
+                        <div class="text-xs text-slate-500">/USDT</div>
+                    </div>
+                    <div class="text-right">
+                        <div class="font-semibold">${formatPrice(m.price)}</div>
+                        <div class="text-sm text-emerald-400">+${formatPct(m.change_24h)}</div>
+                    </div>
+                </div>
+            </a>
+        `).join('');
+    }
+    
+    function renderAllCoins(markets) {
+        const container = document.getElementById('allCoinsList');
+        container.innerHTML = markets.slice(0, 100).map(m => `
+            <a href="/market/${m.symbol}" class="coin-card" hx-get="/partial/market/${m.symbol}" hx-target="#content" hx-push-url="true" hx-swap="innerHTML">
+                <div class="coin-header">
+                    <div class="coin-icon">${m.symbol.replace('USDT', '').slice(0, 3)}</div>
+                    <div class="coin-info">
+                        <div class="coin-symbol">${m.symbol.replace('USDT', '')}</div>
+                        <div class="coin-name">/USDT</div>
+                    </div>
+                    <div class="coin-price">
+                        <div class="price-main">${formatPrice(m.price)}</div>
+                        <div class="price-change ${m.change_24h >= 0 ? 'positive' : 'negative'}" id="change-${m.symbol}">
+                            ${m.change_24h >= 0 ? '↑' : '↓'} ${formatPct(m.change_24h)}
+                        </div>
+                    </div>
+                </div>
+            </a>
+        `).join('');
+    }
+    
+    // Real-time search
+    let searchDebounce;
+    document.getElementById('searchInput')?.addEventListener('input', function(e) {
+        clearTimeout(searchDebounce);
+        searchDebounce = setTimeout(() => {
+            const q = e.target.value.toUpperCase();
+            if (q.length < 2) {
+                document.getElementById('searchResults').innerHTML = '';
+                return;
+            }
+            // Filter locally for instant results
+            const allCoins = document.querySelectorAll('#allCoinsList .coin-card');
+            allCoins.forEach(card => {
+                const symbol = card.querySelector('.coin-symbol')?.textContent || '';
+                if (symbol.includes(q)) {
+                    card.style.display = '';
+                } else {
+                    card.style.display = 'none';
+                }
+            });
+        }, 100);
+    });
+    
+    loadSearchPage();
+</script>

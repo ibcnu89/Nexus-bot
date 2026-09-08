@@ -1,0 +1,41 @@
+{
+  "name": "PowerTrader AI",
+  "short_name": "PowerTrader",
+  "description": "AI-powered crypto trading bot with Binance market data and Alpaca trading",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0a0f1a",
+  "theme_color": "#10b981",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/static/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/static/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["finance", "productivity"],
+  "shortcuts": [
+    {
+      "name": "Markets",
+      "short_name": "Markets",
+      "description": "View live markets",
+      "url": "/",
+      "icons": [{ "src": "/static/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Portfolio",
+      "short_name": "Portfolio",
+      "description": "View portfolio",
+      "url": "/portfolio",
+      "icons": [{ "src": "/static/icon-192.png", "sizes": "192x192" }]
+    }
+  ]
+}
