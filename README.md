@@ -110,7 +110,7 @@ cd web && python -m uvicorn main:app --host 0.0.0.0 --port 8080
 ### Access
 - **Local**: `http://localhost:8080`
 - **Mobile (SSH tunnel)**: `ssh -L 8080:localhost:8080 user@your-server`
-- **Default Login**: `admin` / `admin123` (change on first login)
+- **First Login**: On first startup, a random admin password is generated and printed to console. Check server logs for credentials.
 
 ---
 
@@ -163,14 +163,14 @@ Message types: `prices`, `status`, `fomo_alert`, `fomo_status`
 ## 🔧 Configuration
 
 ### Environment Variables
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SECRET_KEY` | `dev-secret-change-me` | JWT signing key |
-| `ALGORITHM` | `HS256` | JWT algorithm |
-| `ACCESS_TOKEN_EXPIRE_MINUTES` | `1440` | Token lifetime |
-| `WEB_HOST` | `0.0.0.0` | Server host |
-| `WEB_PORT` | `8080` | Server port |
-| `BOT_DIR` | `/home/ibcnu/PowerTraderAI` | Project root |
+|| Variable | Default | Description ||
+||----------|---------|-------------|
+|| `SECRET_KEY` | *(required)* | JWT signing key — must be set in environment ||
+|| `ALGORITHM` | `HS256` | JWT algorithm ||
+|| `ACCESS_TOKEN_EXPIRE_MINUTES` | `1440` | Token lifetime ||
+|| `WEB_HOST` | `0.0.0.0` | Server host ||
+|| `WEB_PORT` | `8080` | Server port ||
+|| `BOT_DIR` | `/home/ibcnu/PowerTraderAI` | Project root ||
 
 ### GUI Settings (`gui_settings.json`)
 ```json

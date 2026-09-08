@@ -6,6 +6,7 @@ Async client for fomoapi.io - social trading data, leaderboards, trader profiles
 import asyncio
 import logging
 import json
+import random
 from typing import Optional, Dict, Any, List, AsyncGenerator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,6 +25,11 @@ FOMO_WS_URL = "wss://api.fomoapi.io/ws/alerts"
 # Rate limiting
 FOMO_RATE_LIMIT = 60  # requests per minute per IP
 FOMO_REQUEST_INTERVAL = 60.0 / FOMO_RATE_LIMIT  # ~1 second between requests
+
+# 429 Retry Configuration
+FOMO_MAX_RETRIES = 3
+FOMO_BASE_RETRY_DELAY = 1.0  # seconds
+FOMO_MAX_RETRY_DELAY = 60.0  # seconds
 
 # Timeouts
 DEFAULT_TIMEOUT = ClientTimeout(total=30)
@@ -261,39 +267,55 @@ class FOMOClient:
         url = f"{self.base_url}{path}"
         
         try:
-            async with session.request(
-                method, url, headers=self._build_headers(), params=params
-            ) as resp:
-                # Handle rate limiting
-                if resp.status == 429:
-                    retry_after = int(resp.headers.get("Retry-After", "60"))
-                    logger.warning(f"FOMO rate limited, retry after {retry_after}s")
-                    raise FOMORateLimitError(f"Rate limited, retry after {retry_after}s")
-                
-                # Handle auth errors
-                if resp.status == 401:
-                    raise FOMOAuthError("Invalid or expired API key")
-                
-                if resp.status == 403:
-                    raise FOMOAuthError("Access forbidden - check API key permissions")
-                
-                if resp.status == 404:
-                    raise FOMONotFoundError(f"Resource not found: {path}")
-                
-                if resp.status >= 500:
-                    raise FOMOServerError(f"FOMO server error: {resp.status}")
-                
-                if resp.status != 200:
-                    text = await resp.text()
-                    raise FOMOError(f"API error {resp.status}: {text[:200]}")
-                
-                data = await resp.json()
-                
-                # Cache successful GET responses
-                if method == "GET" and use_cache and cache_key:
-                    self._set_cache(cache_key, data)
-                
-                return data
+            # Retry loop for 429 handling
+            attempt = 0
+            while True:
+                async with session.request(
+                    method, url, headers=self._build_headers(), params=params
+                ) as resp:
+                    # Handle rate limiting with bounded exponential backoff
+                    if resp.status == 429:
+                        retry_after = int(resp.headers.get("Retry-After", "60"))
+                        logger.warning(f"FOMO rate limited, retry after {retry_after}s (attempt {attempt + 1}/{FOMO_MAX_RETRIES})")
+                        
+                        if attempt >= FOMO_MAX_RETRIES:
+                            raise FOMORateLimitError(f"Rate limited after {FOMO_MAX_RETRIES} retries, retry after {retry_after}s")
+                        
+                        # Calculate delay: exponential backoff with cap, respect Retry-After
+                        delay = min(
+                            FOMO_BASE_RETRY_DELAY * (2 ** attempt) + random.uniform(0, 0.5),
+                            FOMO_MAX_RETRY_DELAY
+                        )
+                        delay = max(delay, retry_after)  # Respect server's Retry-After if longer
+                        logger.info(f"Retrying in {delay:.1f}s...")
+                        await asyncio.sleep(delay)
+                        attempt += 1
+                        continue  # Retry the request
+                    
+                    # Handle auth errors
+                    if resp.status == 401:
+                        raise FOMOAuthError("Invalid or expired API key")
+                    
+                    if resp.status == 403:
+                        raise FOMOAuthError("Access forbidden - check API key permissions")
+                    
+                    if resp.status == 404:
+                        raise FOMONotFoundError(f"Resource not found: {path}")
+                    
+                    if resp.status >= 500:
+                        raise FOMOServerError(f"FOMO server error: {resp.status}")
+                    
+                    if resp.status != 200:
+                        text = await resp.text()
+                        raise FOMOError(f"API error {resp.status}: {text[:200]}")
+                    
+                    data = await resp.json()
+                    
+                    # Cache successful GET responses
+                    if method == "GET" and use_cache and cache_key:
+                        self._set_cache(cache_key, data)
+                    
+                    return data
                 
         except asyncio.TimeoutError:
             raise FOMOConnectionError(f"Request timeout: {path}")

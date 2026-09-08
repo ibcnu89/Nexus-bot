@@ -34,7 +34,9 @@ sys.path.insert(0, str(BOT_DIR))
 from fomo_client import FOMOClient, get_fomo_client, close_fomo_client
 
 # Config
-SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-me")
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY environment variable is required. Set a strong secret for JWT signing.")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
 WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0")
