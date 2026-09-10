@@ -533,7 +533,7 @@ class TestRestartAndResume:
             "entry_price": self.position.entry_price,
             "entry_time": self.position.entry_time,
             "size_sol": self.position.size_sol,
-            "token_amount": self.position.token_amount,
+            "token_amount": self.position.initial_token_amount,
             "state": self.position.state.value,
             "initial_stop_price": self.position.initial_stop_price,
             "trailing_stop_price": self.position.trailing_stop_price,

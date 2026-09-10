@@ -1,0 +1,26 @@
+name: Phase 4 Tests
+
+on:
+  push:
+    paths:
+      - 'research/phase4/**'
+  pull_request:
+    paths:
+      - 'research/phase4/**'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install dependencies
+        run: |
+          cd research/phase4/prototype
+          pip install pytest aiohttp
+      - name: Run tests with timeout
+        run: |
+          cd research/phase4/prototype
+          timeout 60 python -m pytest test_position_manager.py -v --tb=short

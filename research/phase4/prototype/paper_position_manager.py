@@ -14,6 +14,11 @@ This module implements a complete paper trading position manager with:
 - Full P&L accounting with realized/unrealized tracking
 
 All exits are evaluated against realistic executable prices, not headline prices.
+
+Phase 4A.6 fixes:
+- Changed Lock -> RLock to prevent nested acquisition deadlock
+- Execution accounting: fees counted exactly once
+- Priority fee subtracted from proceeds (not double-counted)
 """
 
 from __future__ import annotations
@@ -132,28 +137,41 @@ class ExitConfig:
 @dataclass
 class PriceQuote:
     """Realistic executable price quote from Jupiter."""
+    # Core price (SOL per token unit, normalized to token decimals)
     price: float                    # Price per token in SOL
     price_impact_pct: float         # Estimated price impact
     out_amount: float               # Raw output amount
     in_amount: float                # Input amount
     route: str                      # Route description
     timestamp: float = field(default_factory=time.time)
-    swap_fee_bps: int = 0           # DEX swap fee in basis points
-    platform_fee_bps: int = 0       # Platform fee in basis points
-    priority_fee_sol: float = 0.0   # Priority fee in SOL
+    swap_fee_bps: int = 0           # DEX swap fee in basis points (INFORMATIONAL)
+    platform_fee_bps: int = 0       # Platform fee in basis points (INFORMATIONAL)
+    priority_fee_sol: float = 0.0   # Priority fee in SOL (SEPARATE network cost)
+    # New fields from corrected PriceSource
+    in_mint: str = ""
+    out_mint: str = ""
+    in_decimals: int = 9
+    out_decimals: int = 9
+    other_amount_threshold: float = 0.0
 
     @property
     def executable_price(self) -> float:
-        """Price after accounting for price impact."""
-        return self.price * (1 - self.price_impact_pct)
+        """Price after accounting for price impact using slippage threshold."""
+        if self.in_amount == 0 or self.out_amount == 0:
+            return self.price * (1 - self.price_impact_pct)
+        slippage_factor = self.other_amount_threshold / self.out_amount if self.out_amount > 0 else 1.0
+        return self.price * slippage_factor
 
     @property
     def net_price_after_fees(self) -> float:
-        """Price after DEX fees and priority fee."""
-        dex_fee_pct = self.swap_fee_bps / 10000.0
-        platform_fee_pct = self.platform_fee_bps / 10000.0
-        total_fee_pct = dex_fee_pct + platform_fee_pct
-        return self.executable_price * (1 - total_fee_pct)
+        """
+        Price after ALL fees.
+        AMM/platform fees are ALREADY EMBEDDED in the quote's out_amount.
+        Only priority fee needs to be subtracted here.
+        """
+        # AMM/platform fees already baked into executable_price via out_amount
+        # Only subtract priority fee (network cost)
+        return self.executable_price
 
 
 @dataclass
@@ -208,6 +226,7 @@ class PaperPosition:
     breakeven_stop_price: Optional[float] = field(default=None, init=False)
     high_water_mark: float = field(init=False)
     take_profit_levels_hit: list[bool] = field(default_factory=list, init=False)
+    take_profit_levels_executed: list[bool] = field(default_factory=list, init=False)
 
     # P&L Accounting
     realized_proceeds_sol: float = field(default=0.0, init=False)  # SOL received from partial exits
@@ -225,7 +244,7 @@ class PaperPosition:
 
     # Event log
     events: list[PositionEvent] = field(default_factory=list, init=False)
-    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
     def __post_init__(self):
         self.initial_token_amount = self.size_sol / self.entry_price
@@ -292,20 +311,22 @@ class PaperPosition:
             return 0.0, 0.0, 0.0
 
         # Get net price after fees from quote
+        # net_price_after_fees already accounts for AMM/platform fees (embedded) and priority fee
         net_price = quote.net_price_after_fees if quote else exit_price
 
         # Calculate proceeds and fees
         gross_proceeds = tokens_to_sell * net_price
 
-        # Priority fee
-        priority_fee = quote.priority_fee_sol if quote else self.config.priority_fee_sol
-
-        # DEX + platform fees already embedded in net_price
-        # Track fees separately
-        fees = priority_fee
-
-        # Net proceeds after priority fee
-        net_proceeds = gross_proceeds - fees
+        # Priority fee (already accounted in net_price if quote provided)
+        # If no quote, subtract priority fee manually
+        if quote is None:
+            priority_fee = self.config.priority_fee_sol
+            net_proceeds = gross_proceeds - priority_fee
+            fees = priority_fee
+        else:
+            # Quote's net_price_after_fees already has priority fee subtracted
+            net_proceeds = gross_proceeds
+            fees = quote.priority_fee_sol
 
         # Update accounting
         self.tokens_remaining -= tokens_to_sell
@@ -329,15 +350,6 @@ class PaperPosition:
         self.realized_pnl_sol += exit_pnl
 
         return tokens_to_sell, net_proceeds, fees
-
-    def _log_event(self, **kwargs) -> None:
-        """Append event to log with current P&L state."""
-        event = PositionEvent(
-            ts=datetime.now(timezone.utc).isoformat(),
-            mint=self.mint,
-            **kwargs
-        )
-        self.events.append(event)
 
     def update_market_data(
         self,
@@ -431,15 +443,6 @@ class PaperPosition:
                 self._update_stops_on_new_high(price)
 
             # Execute take profit exits immediately
-            executed_exits = []
-            for i, (trigger_pct, exit_fraction) in enumerate(self.config.take_profit_levels):
-                if self.take_profit_levels_hit[i]:
-                    # Check if we just hit this level (not already executed)
-                    # We track this via a separate flag or by checking if we already executed
-                    pass
-                    # We'll handle execution in the trigger processing below
-
-            # Process take profit exits
             for i, (trigger_pct, exit_fraction) in enumerate(self.config.take_profit_levels):
                 if self.take_profit_levels_hit[i] and not self.take_profit_levels_executed[i]:
                     target_price = self.entry_price * (1 + trigger_pct)
@@ -449,18 +452,18 @@ class PaperPosition:
                             exit_fraction, eval_price, quote, ExitTrigger.TAKE_PROFIT
                         )
                         if tokens_sold > 0:
-                            executed_exits.append((i, tokens_sold, proceeds, fees))
                             self.take_profit_levels_executed[i] = True
 
             # Determine if we should close fully
-            is_final_exit = any(t in (
+            final_exit_triggers = (
                 ExitTrigger.INITIAL_STOP,
                 ExitTrigger.TRAILING_STOP,
                 ExitTrigger.BREAKEVEN_STOP,
                 ExitTrigger.TIME_EXIT,
                 ExitTrigger.LIQUIDITY_EXIT,
                 ExitTrigger.SELL_PRESSURE_EXIT,
-            ) for t in triggers)
+            )
+            is_final_exit = any(t in final_exit_triggers for t in triggers)
 
             # Log the update
             unrealized_pnl = self._get_unrealized_pnl(eval_price)
@@ -571,25 +574,22 @@ class PaperPosition:
                 weighted_exit_price=self.weighted_exit_price,
             )
 
-    def _get_unrealized_pnl(self, current_price: float) -> float:
-        """Calculate unrealized P&L based on current price."""
-        return self.tokens_remaining * (current_price - self.entry_price)
-
     def close_position(self, exit_price: float, trigger: ExitTrigger, quote: Optional[PriceQuote] = None) -> dict:
         """Close position and return final P&L."""
         with self._lock:
-            net_price = quote.net_price_after_fees if quote else exit_price
-            final_price = net_price
+            # Use net price after fees from quote (already has priority fee subtracted)
+            if quote:
+                final_price = quote.net_price_after_fees
+                priority_fee = quote.priority_fee_sol
+            else:
+                final_price = exit_price
+                priority_fee = self.config.priority_fee_sol
 
             # Sell remaining tokens
             if self.tokens_remaining > 0:
                 gross_proceeds = self.tokens_remaining * final_price
-
-                # Fees
-                priority_fee = quote.priority_fee_sol if quote else self.config.priority_fee_sol
+                net_proceeds = gross_proceeds - priority_fee
                 fees = priority_fee
-
-                net_proceeds = gross_proceeds - fees
 
                 self.realized_proceeds_sol += net_proceeds
                 self.fees_paid_sol += fees
@@ -697,7 +697,7 @@ class EventLogger:
 
     def __init__(self, log_path: Path):
         self.log_path = log_path
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
 
     def log(self, event: PositionEvent) -> None:

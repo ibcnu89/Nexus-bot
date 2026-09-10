@@ -4,12 +4,13 @@ Price Source - Jupiter + PumpPortal price feeds for executable price realism.
 Provides realistic price quotes using Jupiter's swap API for actual swap routes,
 including price impact, fees, and slippage estimation.
 
-Key fixes from audit:
+Key fixes from Phase 4A.6 audit:
+- Current Jupiter API endpoints (swap/v1/quote, price/v3, tokens V2)
 - Correct buy/sell amount dimensionality (SOL atomic vs TOKEN atomic)
-- Proper SPL token decimal handling
-- Current Jupiter API endpoints (v6 quote, v4 price is still current)
-- Round-trip consistency tests
-- Accurate fee modeling from route data
+- Proper SPL token decimal handling - never defaults to 9 decimals for executable sizing
+- Execution accounting: AMM/platform fees counted exactly once (embedded in outAmount)
+- Price impact counted exactly once (via otherAmountThreshold for slippage)
+- Priority/network fee counted exactly once (separate from quote)
 """
 
 from __future__ import annotations
@@ -25,17 +26,23 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-# Current Jupiter API endpoints (verified 2025)
-JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote"
-JUPITER_PRICE_API = "https://price.jup.ag/v4/price"
-JUPITER_TOKENS_API = "https://tokens.jup.ag/all"
+# Current Jupiter API endpoints (verified 2025-09-10)
+JUPITER_QUOTE_API = "https://api.jup.ag/swap/v1/quote"
+JUPITER_PRICE_API = "https://api.jup.ag/price/v3"
+JUPITER_TOKENS_API = "https://tokens.jup.ag/all"  # V2/legacy but still works
 
 # PumpPortal API
 PUMPPORTAL_PRICE_API = "https://pumpportal.fun/api/price"
+PUMPPORTAL_WS_API = "wss://pumpportal.fun/api/data"
 
 # Solana constants
 SOL_MINT = "So11111111111111111111111111111111111111112"
 LAMPORTS_PER_SOL = 1_000_000_000
+
+
+class TokenDecimalsError(Exception):
+    """Raised when token decimals cannot be resolved for executable sizing."""
+    pass
 
 
 @dataclass
@@ -50,12 +57,22 @@ class TokenInfo:
 
 @dataclass
 class PriceQuote:
-    """Realistic executable price quote from Jupiter."""
+    """
+    Realistic executable price quote from Jupiter.
+
+    CRITICAL ACCOUNTING INVARIANTS:
+    - outAmount is AFTER AMM/platform fees (do NOT subtract again)
+    - priceImpactPct is informational; use otherAmountThreshold for slippage bounds
+    - swap_fee_bps from route is INFORMATIONAL only (already in outAmount)
+    - platform_fee_bps is INFORMATIONAL only (already in outAmount)
+    - priority_fee_sol is SEPARATE (network cost, not in quote)
+    """
     # Core price (SOL per token unit, normalized to token decimals)
     price_sol_per_token: float
     # Raw quote amounts in atomic units
-    in_amount: int              # Input amount in atomic units
-    out_amount: int             # Output amount in atomic units
+    in_amount: int              # Input amount in atomic units of in_mint
+    out_amount: int             # Output amount in atomic units of out_mint
+    other_amount_threshold: int # Minimum output after slippage
     in_mint: str                # Input mint
     out_mint: str               # Output mint
     in_decimals: int            # Input token decimals
@@ -63,24 +80,39 @@ class PriceQuote:
     # Route info
     route: str
     price_impact_pct: float
-    # Fee info from route
+    # Fee info from route (INFORMATIONAL - already embedded in out_amount)
     swap_fee_bps: int = 0
     platform_fee_bps: int = 0
+    # Priority fee (NOT in quote - separate network cost)
+    priority_fee_sol: float = 0.0
     # Timestamp
     timestamp: float = field(default_factory=time.time)
 
     @property
     def executable_price(self) -> float:
-        """Price after accounting for price impact."""
-        return self.price_sol_per_token * (1 - self.price_impact_pct)
+        """Price after accounting for price impact (using slippage threshold)."""
+        if self.in_amount == 0:
+            return self.price_sol_per_token
+        # Use other_amount_threshold for worst-case slippage scenario
+        slippage_factor = self.other_amount_threshold / self.out_amount if self.out_amount > 0 else 1.0
+        return self.price_sol_per_token * slippage_factor
 
     @property
     def net_price_after_fees(self) -> float:
-        """Price after all fees from route data."""
-        # Total fees in basis points
-        total_fee_bps = self.swap_fee_bps + self.platform_fee_bps
-        total_fee_pct = total_fee_bps / 10000.0
-        return self.executable_price * (1 - total_fee_pct)
+        """
+        Price after ALL fees.
+        AMM/platform fees are ALREADY EMBEDDED in out_amount.
+        Only priority fee needs to be subtracted here.
+        """
+        # AMM/platform fees already baked into out_amount -> executable_price
+        # Only subtract priority fee (network cost)
+        if self.out_mint == SOL_MINT:
+            # SELL: output is SOL, priority fee reduces SOL received
+            priority_fee_per_token = self.priority_fee_sol / (self.out_amount / LAMPORTS_PER_SOL) if self.out_amount > 0 else 0
+            return self.executable_price - priority_fee_per_token
+        else:
+            # BUY: output is token, priority fee is SOL cost separate from token amount
+            return self.executable_price
 
     def get_sol_amount(self) -> Decimal:
         """Get SOL amount from quote (handles both buy/sell)."""
@@ -108,6 +140,7 @@ class PriceSource:
     - SELL (token -> SOL): input amount in token atomic units, output in SOL atomic units (lamports)
     - All prices normalized to SOL per human-readable token
     - Token decimals fetched from Jupiter token list and cached
+    - Failure to resolve decimals fails closed for executable sizing
     """
 
     def __init__(
@@ -124,10 +157,10 @@ class PriceSource:
         self._session: Optional[aiohttp.ClientSession] = None
         self._token_decimals_cache: Dict[str, int] = {}
         self._token_info_cache: Dict[str, TokenInfo] = {}
+        self._decimals_resolved: set = set()  # Track which mints we've resolved
 
     async def __aenter__(self):
         self._session = aiohttp.ClientSession(timeout=self.timeout)
-        # Preload token info cache
         await self._load_token_list()
         return self
 
@@ -163,10 +196,19 @@ class PriceSource:
             logger.warning(f"Failed to load Jupiter token list: {e}")
 
     def get_token_decimals(self, mint: str) -> int:
-        """Get token decimals, defaulting to 9 for unknown tokens."""
+        """Get token decimals. For SOL, returns 9. For unknown, raises for executable sizing."""
         if mint == SOL_MINT:
             return 9
-        return self._token_decimals_cache.get(mint, 9)
+        if mint in self._token_decimals_cache:
+            return self._token_decimals_cache[mint]
+        # For executable sizing, we MUST have decimals - fail closed
+        raise TokenDecimalsError(f"Token decimals unknown for {mint}. Cannot size executable order.")
+
+    def get_token_decimals_or_none(self, mint: str) -> Optional[int]:
+        """Get token decimals, returning None if unknown (for display only)."""
+        if mint == SOL_MINT:
+            return 9
+        return self._token_decimals_cache.get(mint)
 
     def get_token_info(self, mint: str) -> Optional[TokenInfo]:
         """Get full token info."""
@@ -217,6 +259,7 @@ class PriceSource:
             "outputMint": output_mint,
             "amount": str(amount),
             "slippageBps": str(slippage_bps),
+            "restrictIntermediateTokens": "true",
             "onlyDirectRoutes": "false",
             "asLegacyTransaction": "false",
         }
@@ -224,12 +267,13 @@ class PriceSource:
         try:
             data = await self._fetch_with_retry(self.jupiter_api_url, params)
 
-            # Parse Jupiter quote response
+            # Parse Jupiter quote response (current V1 schema)
             in_amount = int(data["inAmount"])
             out_amount = int(data["outAmount"])
+            other_amount_threshold = int(data.get("otherAmountThreshold", out_amount))
             price_impact = float(data.get("priceImpactPct", 0))
 
-            # Extract fee info from route
+            # Extract fee info from route (INFORMATIONAL - already in out_amount)
             swap_fee_bps = 0
             platform_fee_bps = 0
             route_label = "Jupiter"
@@ -237,25 +281,25 @@ class PriceSource:
                 for step in data["routePlan"]:
                     swap_info = step.get("swapInfo", {})
                     swap_fee_bps += swap_info.get("feeBps", 0)
-                    # Platform fees might be in other fields
+                    # Platform fee might be at top level
                 route_label = data["routePlan"][0].get("swapInfo", {}).get("label", "Jupiter")
 
-            # Get token decimals
+            platform_fee_bps = data.get("platformFee", {}).get("feeBps", 0) if data.get("platformFee") else 0
+
+            # Get token decimals (will raise if unknown and needed for executable sizing)
             in_decimals = self.get_token_decimals(input_mint)
             out_decimals = self.get_token_decimals(output_mint)
 
             # Calculate price: SOL per human-readable token
             if output_mint == SOL_MINT:
                 # SELL: token -> SOL
-                # price = SOL_out / token_in (human units)
                 sol_out = out_amount / LAMPORTS_PER_SOL
-                token_in = in_amount / (10 ** self.get_token_decimals(input_mint))
+                token_in = in_amount / (10 ** in_decimals)
                 price_sol_per_token = sol_out / token_in if token_in > 0 else 0
             else:
                 # BUY: SOL -> token
-                # price = token_out / SOL_in (human units)
                 sol_in = in_amount / LAMPORTS_PER_SOL
-                token_out = out_amount / (10 ** self.get_token_decimals(output_mint))
+                token_out = out_amount / (10 ** out_decimals)
                 price_sol_per_token = sol_in / token_out if token_out > 0 else 0
 
             return PriceQuote(
@@ -263,14 +307,17 @@ class PriceSource:
                 price_impact_pct=price_impact,
                 in_amount=in_amount,
                 out_amount=out_amount,
+                other_amount_threshold=other_amount_threshold,
                 in_mint=input_mint,
                 out_mint=output_mint,
-                in_decimals=self.get_token_decimals(input_mint),
-                out_decimals=self.get_token_decimals(output_mint),
-                route=data.get("routePlan", [{}])[0].get("swapInfo", {}).get("label", "Jupiter"),
-                swap_fee_bps=sum(step.get("swapInfo", {}).get("feeBps", 0) for step in data.get("routePlan", [])),
-                platform_fee_bps=0,  # Jupiter doesn't add platform fee in quote
+                in_decimals=in_decimals,
+                out_decimals=out_decimals,
+                route=route_label,
+                swap_fee_bps=swap_fee_bps,
+                platform_fee_bps=platform_fee_bps,
             )
+        except TokenDecimalsError:
+            raise
         except Exception as e:
             logger.warning(f"Jupiter quote failed for {input_mint}->{output_mint}: {e}")
             return None
@@ -285,12 +332,13 @@ class PriceSource:
             if price <= 0:
                 return None
 
-            decimals = self.get_token_decimals(mint)
+            decimals = self.get_token_decimals_or_none(mint) or 9
             return PriceQuote(
                 price_sol_per_token=price,
                 price_impact_pct=0.01,  # Estimate 1% impact for bonding curve
                 in_amount=0,
                 out_amount=0,
+                other_amount_threshold=0,
                 in_mint=mint,
                 out_mint=SOL_MINT,
                 in_decimals=decimals,
@@ -330,14 +378,14 @@ class PriceSource:
         Input: token amount in human units (e.g., 1000 tokens)
         Returns quote with input in token atomic units, output in lamports.
         """
-        decimals = self.get_token_decimals(mint)
+        decimals = self.get_token_decimals(mint)  # Fails closed if unknown
         amount = int(token_amount_human * (10 ** decimals))
         return await self.get_jupiter_quote(mint, SOL_MINT, amount, slippage_bps)
 
     async def get_price(
         self,
         mint: str,
-        side: str = "sell",  # "buy" = SOL->token, "sell" = token->SOL
+        side: str = "sell",
         size_sol: float = 0.1,
         is_graduated: bool = False,
     ) -> Optional[PriceQuote]:
@@ -346,70 +394,48 @@ class PriceSource:
 
         side: "buy" = SOL -> token, "sell" = token -> SOL
         size_sol: position size in SOL (for buy) or SOL value (for sell)
+
+        For SELL: requires actual token inventory to quote correctly.
         """
         if is_graduated or mint == SOL_MINT:
-            # Graduated token - use Jupiter
-            decimals = self.get_token_decimals(mint)
+            decimals = self.get_token_decimals_or_none(mint)
+            if decimals is None:
+                logger.warning(f"Unknown decimals for {mint}, cannot quote")
+                return None
 
             if side == "sell":
                 # SELL: token -> SOL
-                # Input: token amount equivalent to size_sol at current price
-                # We need a price estimate first - use a small quote or fallback
-                # For now, use size_sol as SOL value and convert to token amount
-                # This is approximate; in production, you'd get a current price first
-                token_amount = int((size_sol * LAMPORTS_PER_SOL) / 10**9)  # Rough estimate
-                input_mint, output_mint = mint, SOL_MINT
-                amount = token_amount
+                # Need a price estimate first - this is a fallback only
+                # In production, caller should use get_sell_quote with actual token amount
+                # Estimate token amount from size_sol at rough current price
+                # This is APPROXIMATE - prefer get_sell_quote with real inventory
+                price_estimate = await self.get_multiple_prices([mint])
+                est_price = price_estimate.get(mint, 0.0005)
+                if est_price <= 0:
+                    est_price = 0.0005
+                token_amount_human = size_sol / est_price
+                return await self.get_sell_quote(mint, token_amount_human)
             else:
                 # BUY: SOL -> token
-                # Input: SOL in lamports
-                input_mint, output_mint = SOL_MINT, mint
-                amount = int(size_sol * LAMPORTS_PER_SOL)
-
-            return await self.get_jupiter_quote(input_mint, output_mint, amount)
+                return await self.get_buy_quote(mint, size_sol)
         else:
-            # Pre-graduation bonding curve token - use PumpPortal
             return await self.get_pumpportal_price(mint)
 
     async def get_multiple_prices(self, mints: list[str], vs_mint: str = SOL_MINT) -> dict[str, float]:
-        """Get current prices for multiple tokens (simple price, not executable quote)."""
+        """Get current prices for multiple tokens using Price API V3."""
         if not mints:
             return {}
 
-        params = {"ids": ",".join(mints), "vsToken": vs_mint}
+        params = {"ids": ",".join(mints)}
         try:
             session = await self._get_session()
             async with session.get(JUPITER_PRICE_API, params=params) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return {mint: float(info["price"]) for mint, info in data.get("data", {}).items()}
+                    return {mint: float(info.get("usdPrice", 0)) for mint, info in data.items()}
         except Exception as e:
             logger.warning(f"Batch price fetch failed: {e}")
         return {}
-
-    async def _fetch_with_retry(self, url: str, params: dict) -> dict:
-        """Fetch with exponential backoff retry."""
-        session = await self._get_session()
-        for attempt in range(self.max_retries):
-            try:
-                async with session.get(url, params=params) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-                    elif resp.status == 429:
-                        wait = 2 ** attempt
-                        logger.warning(f"Rate limited, waiting {wait}s")
-                        await asyncio.sleep(wait)
-                    else:
-                        logger.warning(f"HTTP {resp.status} from {url}")
-            except asyncio.TimeoutError:
-                logger.warning(f"Timeout fetching {url} (attempt {attempt + 1})")
-            except Exception as e:
-                logger.warning(f"Error fetching {url}: {e}")
-
-            if attempt < self.max_retries - 1:
-                await asyncio.sleep(2 ** attempt)
-
-        raise RuntimeError(f"Failed to fetch {url} after {self.max_retries} retries")
 
 
 class MockPriceSource:
@@ -443,6 +469,7 @@ class MockPriceSource:
             price_impact_pct=price_impact,
             in_amount=0,
             out_amount=0,
+            other_amount_threshold=0,
             in_mint=mint,
             out_mint=SOL_MINT,
             in_decimals=9,
