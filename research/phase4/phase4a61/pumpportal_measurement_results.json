@@ -1,0 +1,39 @@
+{
+  "sample_duration_seconds": 598.0034475326538,
+  "total_messages": 284,
+  "new_token_events": 283,
+  "unique_mints": 251,
+  "duplicate_events": 32,
+  "malformed_events": 0,
+  "events_per_minute": 28.394485132249695,
+  "avg_payload_size_bytes": 559.5598591549295,
+  "unique_mints_per_minute": 25.18380130104125,
+  "duplicate_rate_pct": 11.307420494699647,
+  "reconnect_count": 0,
+  "missing_metadata_fields": {
+    "name": 78,
+    "symbol": 78,
+    "uri": 78,
+    "creator": 283,
+    "bondingCurve": 283
+  },
+  "sample_mint": "BbLC18nJr69KYrtSm62ozwNmyZPxvWG8rgieLxVVpump",
+  "sample_payload": {
+    "signature": "4FwZG3az1KJ5Qf4T8pQxgwhg8NT5mwLPFKjoYAsku8RFPVyMLT5ZjgFct4o9X9u6a1ZML4NhbgRzc2aHXcyQfarn",
+    "mint": "BbLC18nJr69KYrtSm62ozwNmyZPxvWG8rgieLxVVpump",
+    "traderPublicKey": "pjxuTGipa4yWrbNY5DWbwKVWF3Z8bNGFjrny1CNgWg8",
+    "txType": "create",
+    "initialBuy": 250631.991174,
+    "solAmount": 0.007009055,
+    "bondingCurveKey": "GyNMtCAwk3Y4BcGzc5HWGNo1JVHAczSdpNg8Gim5bp86",
+    "vTokensInBondingCurve": 1072749368.008826,
+    "vSolInBondingCurve": 30.00700905538558,
+    "marketCapSol": 27.97205941130762,
+    "name": "Quantum Tardigrade",
+    "symbol": "pump",
+    "uri": "https://ipfs.io/ipfs/QmXMMs5PgQftG9jsbvKRBQo3vmi71uryEYWVF9aZYDpweb",
+    "is_mayhem_mode": false,
+    "pool": "pump"
+  },
+  "timestamp": "2026-09-10 22:23:51 UTC"
+}

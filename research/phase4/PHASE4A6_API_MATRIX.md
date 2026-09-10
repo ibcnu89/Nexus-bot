@@ -1,4 +1,6 @@
-# Phase 4A.6 API Matrix — Current Provider Endpoints & Limits (Verified 2025-09-10)
+# Phase 4A.6 API Matrix — Current Provider Endpoints & Limits (Verified 2026-09-10)
+
+> **Corrected 2026-09-10**: Updated verification dates from 2025 to 2026. Added PumpPortal free discovery finding.
 
 ## Jupiter Aggregator API
 
@@ -128,17 +130,19 @@ Trade Local:    https://pumpportal.fun/api/trade-local
 | Endpoint | Method | Auth | Classification | Rate Limit | Use Case |
 |----------|--------|------|----------------|------------|----------|
 | `/api/price` | GET | None | FREE | ~5/s | Bonding curve price |
-| `/api/data` (WS) | WS | API Key | See streams | 1 conn | Real-time data |
+| `/api/data` (WS) | WS | Optional (API Key) | See streams | 1 conn | Real-time data |
 | `/api/trade-local` | POST | API Key | METERED_CRYPTO | ~5/s | Build unsigned tx |
 
-### WebSocket Streams (require API key + funded wallet ≥0.02 SOL)
+### WebSocket Streams
 
-| Stream | Classification | Cost | Wallet Required |
-|--------|---------------|------|-----------------|
-| `subscribeNewToken` | FREE | No charge | No |
-| `subscribeMigration` | FREE | No charge | No |
-| `subscribeTokenTrade` | METERED_CRYPTO | 0.01 SOL per 10k events | Yes (0.02 SOL) |
-| `subscribeAccountTrade` | METERED_CRYPTO | 0.01 SOL per 10k events | Yes (0.02 SOL) |
+| Stream | Classification | Cost | Wallet Required | API Key Required |
+|--------|---------------|------|-----------------|------------------|
+| `subscribeNewToken` | **FREE** | No charge | No | **Optional** (works without) |
+| `subscribeMigration` | **FREE** | No charge | No | Optional |
+| `subscribeTokenTrade` | METERED_CRYPTO | 0.01 SOL per 10k events | Yes (0.02 SOL) | Required |
+| `subscribeAccountTrade` | METERED_CRYPTO | 0.01 SOL per 10k events | Yes (0.02 SOL) | Required |
+
+**Key Finding (2026-09-10)**: `subscribeNewToken` works **without API key**, provides ~28 events/min, ~25 unique mints/min, sub-second latency, stable connection.
 
 ### `/api/price` Response
 ```json
@@ -183,14 +187,14 @@ RPC:     https://mainnet.helius-rpc.com/?api-key=YOUR_KEY
 WSS:     wss://mainnet.helius-rpc.com/?api-key=YOUR_KEY
 ```
 
-### Free Tier Limits (Verified 2025-09-10)
+### Free Tier Limits (Verified 2026-09-10)
 | Feature | Limit |
 |---------|-------|
 | Monthly Credits | 1,000,000 |
 | RPC Rate Limit | 10 req/s |
 | DAS API | 2 req/s |
 | Enhanced APIs | 2 req/s |
-| Standard WSS (logsSubscribe, accountSubscribe) | Included (metered) |
+| Standard WSS (logsSubscribe, accountSubscribe) | Included (metered: 2 credits/0.1 MB) |
 | Enhanced WSS (transactionSubscribe, enhanced accountSubscribe) | NOT available |
 | LaserStream gRPC | NOT available |
 | Concurrent WS Connections | 5 |
@@ -227,16 +231,37 @@ WSS:     wss://mainnet.helius-rpc.com/?api-key=YOUR_KEY
 
 ---
 
+## Public Solana RPC (Fallback)
+
+### Base URLs
+```
+RPC:     https://api.mainnet-beta.solana.com
+WSS:     wss://api.mainnet-beta.solana.com
+```
+
+### Verified Status (2026-09-10)
+| Feature | Status |
+|---------|--------|
+| `logsSubscribe` | ✅ Supported |
+| HTTP RPC | ✅ Supported |
+| Rate Limits | Unpublished, no SLA |
+| SLA | None |
+
+**Only `api.mainnet-beta.solana.com` supports `logsSubscribe` among free public endpoints tested. Alchemy demo and Ankr rejected connections.**
+
+---
+
 ## Rate Limit Summary
 
-| Provider | Free Tier | Our Expected Usage | Headroom | Backoff Strategy |
-|----------|-----------|-------------------|----------|------------------|
+| Provider | Free Tier | Expected Usage | Headroom | Backoff Strategy |
+|----------|-----------|----------------|----------|------------------|
 | Jupiter Quote | 100 req/s | 10/s | 10x | Token bucket (100 tokens, 100/s refill) |
 | Jupiter Price V3 | 100 req/s | 10/s | 10x | Token bucket |
 | PumpPortal Price | ~5/s | 2/s | 2.5x | Exponential backoff |
-| PumpPortal WS | 1 conn | 1 conn | N/A | Auto-reconnect |
-| Helius RPC | 10 req/s / 33k credits/day | ~50k credits/day | **-52%** | Queue + backoff + reduce bandwidth |
-| Helius WS | 5 conn | 1 conn | 5x | Auto-reconnect |
+| PumpPortal WS (subscribeNewToken) | FREE, 1 conn | 1 conn | N/A | Auto-reconnect (0 in 10-min test) |
+| Helius RPC | 10 req/s / 33k credits/day | ~5,440 credits/day (hybrid conservative) | **5.5x** | Queue + backoff |
+| Helius WS | 5 conn | 0 (not used for discovery) | N/A | N/A |
+| Public RPC (api.mainnet-beta) | Unlimited rate-limited | Fallback only | N/A | Exponential backoff |
 
 ---
 
@@ -257,10 +282,11 @@ WSS:     wss://mainnet.helius-rpc.com/?api-key=YOUR_KEY
 
 | Component | Current Version | Last Verified | Adapter Pattern |
 |-----------|-----------------|---------------|-----------------|
-| Jupiter Quote | V1 (swap/v1) | 2025-09-10 | Base URL configurable |
-| Jupiter Price | V3 | 2025-09-10 | Base URL configurable |
-| Jupiter Tokens | V2 (legacy) | 2025-09-10 | Base URL configurable |
-| PumpPortal | - | 2025-09-10 | Base URL configurable |
-| Helius RPC | - | 2025-09-10 | Standard JSON-RPC |
+| Jupiter Quote | V1 (swap/v1) | 2026-09-10 | Base URL configurable |
+| Jupiter Price | V3 | 2026-09-10 | Base URL configurable |
+| Jupiter Tokens | V2 (legacy) | 2026-09-10 | Base URL configurable |
+| PumpPortal | - | 2026-09-10 | Base URL configurable |
+| Helius RPC | - | 2026-09-10 | Standard JSON-RPC |
+| Public RPC | - | 2026-09-10 | Standard JSON-RPC |
 
 **All base URLs are configurable constants for future API version changes.**

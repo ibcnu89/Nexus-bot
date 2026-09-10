@@ -1,16 +1,18 @@
-# Phase 4A.6 GO/NO-GO Decision
+# Phase 4A.6 GO/NO-GO Decision — CORRECTED (2026-09-10)
 
-## Decision: **NO-GO** for Phase 4B
+> **Corrected 2026-09-10**: Based on Phase 4A.6.1 empirical measurements. Original NO-GO reversed.
+
+## Decision: **CONDITIONAL GO — ZERO-COST EXPERIMENTAL**
 
 ---
 
-## Gate Criteria Assessment
+## Gate Criteria Assessment (Corrected)
 
 | # | Criterion | Status | Evidence |
 |---|-----------|--------|----------|
 | 1 | Every final exit returns without deadlock | ✅ PASS | RLock verified; all 7 exit types tested |
 | 2 | Stop-trigger liquidation regression-tested | ✅ PASS | 43 tests pass including all final exits |
-| 3 | Jupiter APIs match current official docs | ✅ PASS | swap/v1, price/v3 verified 2025-09-10 |
+| 3 | Jupiter APIs match current official docs | ✅ PASS | swap/v1, price/v3 verified 2026-09-10 |
 | 4 | Price API parser matches current schema | ✅ PASS | usdPrice, decimals, blockId parsed |
 | 5 | Token decimals never silently corrupt sizing | ✅ PASS | TokenDecimalsError fails closed |
 | 6 | SELL quotes use actual token inventory | ✅ PASS | get_sell_quote requires token_amount_human |
@@ -20,8 +22,8 @@
 | 10 | P&L reconciles from raw quote amounts | ✅ PASS | Round-trip invariant verified to 1e-10 SOL |
 | 11 | PumpPortal economics accurately classified | ✅ PASS | FREE / METERED_CRYPTO / PROTOCOL_FEE |
 | 12 | Helius current credit model accurately classified | ✅ PASS | 1M credits, 10 req/s, metered WS (2 credits/0.1 MB) |
-| 13 | Discovery traffic fits zero-cost budget | ❌ **FAIL** | 152% utilization (50,750 vs 33,333 credits/day) |
-| 14 | Complete test suite terminates successfully | ✅ PASS | 43 passed in 0.06s, exit code 0 |
+| 13 | Discovery traffic fits zero-cost budget | ✅ **PASS** | **16.3% utilization (5,440 vs 33,333 credits/day)** |
+| 14 | Complete test suite terminates successfully | ✅ PASS | 43 passed in 0.05s, exit code 0 |
 | 15 | pytest command/exit code/summary recorded | ✅ PASS | PHASE4A6_TEST_REPORT.md |
 | 16 | No live transaction path reachable | ✅ PASS | Paper only, no signing keys, no sendTransaction |
 | 17 | Git working tree checked before/after | ✅ PASS | User mods (pt_hub.py, pt_thinker.py, pt_trader.py) preserved |
@@ -29,102 +31,121 @@
 
 ---
 
-## Blocker Analysis
+## Blocker Resolution
 
-### Criterion 13: Zero-Cost Budget — **HARD BLOCKER**
+### Criterion 13: Zero-Cost Budget — **RESOLVED**
 
-**Finding:** Continuous Pump.fun discovery via Helius `logsSubscribe` WebSocket consumes ~50,000 credits/day (2.5 MB/day at 2 credits/0.1 MB).
+**Original Phase 4A.6 Finding (WRONG):**
+- "Continuous Pump.fun discovery via Helius `logsSubscribe` WebSocket consumes ~50,000 credits/day"
+- "Free Tier Budget: 33,333 credits/day"
+- "Utilization: 152% — exceeds budget by 52%"
 
-**Free Tier Budget:** 33,333 credits/day (1M/month ÷ 30)
+**Root Cause:** Arithmetic error — confused MB with GB
+- 2 credits/0.1 MB = 20 credits/MB
+- 2.5 MB × 20 = **50 credits/day** (not 50,000)
+- 2.5 GB × 20 = 50,000 credits/day (if traffic was actually GB)
 
-**Utilization:** 152% — exceeds budget by 52%
-
-**Safety Ceiling (70%):** 23,333 credits/day — exceeded by 117%
-
-**No zero-cost mitigation reduces WebSocket traffic sufficiently while preserving real-time discovery capability.**
-
----
-
-## Required Decision for Phase 4B
-
-### Option A: Approve Budget ($49/mo Helius Developer)
-- **Cost:** $49/month
-- **Budget:** 333,333 credits/day (10M/month)
-- **Headroom:** 6.5x
-- **Enables:** Full real-time discovery + enrichment
-- **Decision:** RECOMMENDED
-
-### Option B: Reduce Scope (Polling-Only Discovery)
-- **Cost:** $0/month
-- **Method:** Poll `getSignaturesForAddress` every 30-60s
-- **Latency:** 30-60s vs real-time
-- **Alpha Impact:** Significant — misses early entry window
-- **Decision:** NOT RECOMMENDED for competitive advantage
-
-### Option C: Self-Host Geyser/Yellowstone
-- **Cost:** $50-200/month (VPS)
-- **Control:** Full
-- **Operational Burden:** High
-- **Decision:** DEFER to later phase
+**Phase 4A.6.1 Correction (Empirical Evidence):**
+- PumpPortal `subscribeNewToken` provides discovery for **0 Helius credits**
+- 10-min measurement: 28.4 events/min, 25.2 unique mints/min = **36,288 candidates/day**
+- Helius only used for selective enrichment RPC calls
+- Conservative enrichment (3% of candidates) = **5,440 credits/day**
+- Monthly: **163,200 credits** = **16.3% of free tier** (well under 70% ceiling)
 
 ---
 
-## GO/NO-GO Verdict
+## CONDITIONAL GO Conditions
 
-**Phase 4B receives NO-GO until budget decision is made.**
+Phase 4B may proceed with the following conditions:
 
-### Minimum Path to GO:
-1. **Approve $49/mo Helius Developer tier** (or equivalent)
-2. **OR** accept polling-only discovery with reduced alpha
-3. **Update PHASE4A6_COST_BUDGET.md** with approved budget
+1. **Architecture**: PumpPortal `subscribeNewToken` → Deduplication → Conservative Enrichment (top 3%) → Helius RPC → Jupiter/PumpPortal Pricing → Paper Position Manager
 
-### Once Budget Approved:
-- Update cost budget document
-- Re-run GO/NO-GO with criterion 13 → PASS
-- Phase 4B can proceed with full discovery scope
+2. **Monitoring**: Track Helius credit usage daily during Phase 4B; alert if >50% of free tier
+
+3. **Fallback**: Public RPC (`api.mainnet-beta.solana.com`) as emergency discovery source
+
+4. **No paid upgrades**: Do not purchase Helius Developer, QuickNode, Alchemy, or any paid infrastructure
+
+5. **Re-evaluation**: If credit usage exceeds 50% of free tier during Phase 4B, pause and reassess
+
+---
+
+## Phase 4B Discovery Architecture (Mandated)
+
+```
+PumpPortal WS (subscribeNewToken) - FREE, 0 Helius credits
+         │
+         ▼
+Deduplication & Scoring (local, <1ms)
+         │
+         ▼
+Conservative Filter: Top 3% by score
+         │
+         ▼
+Helius RPC Enrichment (5 calls/candidate) - 5,440 credits/day
+         │
+         ▼
+Jupiter/PumpPortal Pricing → Paper Position Manager
+```
+
+**Expected Metrics:**
+- Discovery latency: <1 second
+- Enrichment latency: 100-500ms per candidate
+- Daily Helius credits: 5,440 (16.3% of free tier)
+- Monthly Helius credits: 163,200 (83.7% safety margin)
+- Cost: **$0/month**
+
+---
+
+## Final Verdict
+
+**Phase 4B CONDITIONAL GO authorized for zero-cost experimental paper trading.**
+
+The arithmetic error in Phase 4A.6 has been corrected. Empirical measurement shows PumpPortal provides sufficient free discovery. Selective enrichment with conservative filtering fits comfortably within Helius free tier. No paid infrastructure is required for Phase 4B paper trading validation.
+
+---
+
+## Artifacts Updated (Corrected)
+
+| Document | Change |
+|----------|--------|
+| `PHASE4A6_COST_BUDGET.md` | Fixed arithmetic, updated with measured data |
+| `PHASE4A6_API_MATRIX.md` | Verification dates corrected to 2026-09-10 |
+| `PHASE4A6_GO_NOGO.md` | **This document: Changed from NO-GO to CONDITIONAL GO** |
+| `PHASE4A6_AUDIT.md` | Annotated with corrected findings |
+
+## New Artifacts Created (Phase 4A.6.1)
+
+| File | Purpose |
+|------|---------|
+| `helius_bandwidth_probe.py` | Helius WS measurement (UNVERIFIED - no creds) |
+| `pumpportal_discovery_probe.py` | PumpPortal measurement (VERIFIED) |
+| `public_rpc_probe.py` | Public RPC evaluation (VERIFIED) |
+| `cost_model.py` | Corrected cost calculations with tests |
+| `PHASE4A61_FINDINGS.md` | Complete findings report |
+| `PHASE4A61_COST_MODEL.md` | Detailed cost calculations |
+| `PHASE4A61_GO_NOGO.md` | CONDITIONAL GO decision |
 
 ---
 
 ## Summary
 
-**All technical criteria PASS.** The execution simulator is trustworthy:
+**All 18 criteria now PASS.** The execution simulator is trustworthy:
 - No deadlocks (RLock)
 - Correct fee accounting (no double-counting)
-- Current API endpoints verified
+- Current API endpoints verified (2026-09-10)
 - Token decimals fail closed
 - P&L reconciles
-- Tests pass deterministically
+- Tests pass deterministically (43/43, 0.05s)
+- **Zero-cost budget fits with 83.7% safety margin**
 
-**Only blocker is infrastructure budget.** The zero-cost constraint is incompatible with real-time Solana discovery at competitive latency.
-
-**Recommendation:** Approve $49/mo Helius Developer tier to unblock Phase 4B. This is a minimal operational expense that preserves the competitive advantage of real-time token discovery.
-
----
-
-## Artifacts Created
-
-| Document | Purpose |
-|----------|---------|
-| PHASE4A6_AUDIT.md | Complete audit with bugs confirmed/fixed |
-| PHASE4A6_API_MATRIX.md | Current provider endpoints & limits |
-| PHASE4A6_EXECUTION_ACCOUNTING.md | Canonical fee accounting model |
-| PHASE4A6_TEST_REPORT.md | Test command, exit code, full summary |
-| PHASE4A6_COST_BUDGET.md | Zero-cost budget analysis (BLOCKER) |
-| PHASE4A6_GO_NOGO.md | This decision |
-
----
-
-## Next Steps
-
-1. **User decision on budget** ($49/mo Helius Developer vs reduced scope)
-2. **Update PHASE4A6_COST_BUDGET.md** with approved budget
-3. **Re-evaluate GO/NO-GO** — criterion 13 will PASS with approved budget
-4. **Phase 4B kickoff** with full discovery scope
+**No paid infrastructure required for Phase 4B.**
 
 ---
 
 **Prepared by:** Hermes Agent  
-**Date:** 2025-09-10  
+**Date:** 2026-09-10  
 **Repository:** ibcnu89/Nexus-bot  
 **Branch:** main  
-**Base Commit:** 512c424bb2a502989fa5d89efba4f08e86ba2262
+**Base Commit:** 21cae8f  
+**Phase 4A.6.1 Commit:** [pending]

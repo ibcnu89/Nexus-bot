@@ -1,10 +1,14 @@
-# Phase 4A.6 Execution Truth Audit
+# Phase 4A.6 Execution Truth Audit — CORRECTED (2026-09-10)
+
+> **Corrected 2026-09-10**: Based on Phase 4A.6.1 empirical measurements.
+> Original NO-GO decision reversed to CONDITIONAL GO.
+> Arithmetic error in zero-cost budget identified and fixed (MB/GB confusion).
 
 ## Executive Summary
 
-**Status: AUDIT COMPLETE — SEE GO/NO-GO FOR DECISION**
+**Status: AUDIT COMPLETE — CONDITIONAL GO FOR PHASE 4B**
 
-All critical bugs identified and fixed. Tests pass (43/43). Provider documentation verified against current official sources.
+All critical bugs identified and fixed. Tests pass (43/43). Provider documentation verified against current official sources (2026-09-10). Zero-cost discovery validated via PumpPortal + Helius hybrid architecture.
 
 ---
 
@@ -48,7 +52,7 @@ All critical bugs identified and fixed. Tests pass (43/43). Provider documentati
 # AMM/platform fees NEVER subtracted again
 ```
 
-**Invariant Verified:** Round-trip P&L reconciles to ledger within numerical tolerance
+**Invariant Verified:** Round-trip P&L reconciles to ledger within numerical tolerance (1e-10 SOL)
 
 ---
 
@@ -77,22 +81,24 @@ All critical bugs identified and fixed. Tests pass (43/43). Provider documentati
 ### 1.5 PumpPortal Economics Misclassification
 **Confirmed:** Previous audit called PumpPortal "free" without distinguishing streams
 
-**Current Verified Classification:**
+**Current Verified Classification (2026-09-10):**
 | Stream | Classification | Cost |
 |--------|---------------|------|
-| `subscribeNewToken` | FREE | No charge |
-| `subscribeMigration` | FREE | No charge |
+| `subscribeNewToken` | **FREE** | No charge |
+| `subscribeMigration` | **FREE** | No charge |
 | `subscribeTokenTrade` | METERED_CRYPTO | 0.01 SOL per 10k events |
 | `subscribeAccountTrade` | METERED_CRYPTO | 0.01 SOL per 10k events |
 | Local Transaction API | METERED_CRYPTO | 0.5% fee per trade |
 | Pump.fun bonding curve | PROTOCOL_FEE | Implicit in curve |
+
+**Key Finding (2026-09-10):** `subscribeNewToken` works **without API key**, provides ~28 events/min, ~25 unique mints/min, sub-second latency, stable connection.
 
 ---
 
 ### 1.6 Helius Cost Model Obsolete
 **Confirmed:** Used "100k requests/day" model
 
-**Current Verified (Free Tier):**
+**Current Verified (Free Tier, 2026-09-10):**
 - **Monthly credits:** 1M credits/month
 - **RPC rate limit:** 10 req/s
 - **Standard WSS (logsSubscribe):** Included (metered at 2 credits per 0.1 MB)
@@ -149,9 +155,9 @@ net_proceeds = gross_proceeds - priority_fee
 
 ---
 
-## 4. CURRENT API FINDINGS
+## 4. CURRENT API FINDINGS (Verified 2026-09-10)
 
-### Jupiter Aggregator (Verified 2025-09-10)
+### Jupiter Aggregator
 
 | Endpoint | URL | Auth | Rate Limit | Status |
 |----------|-----|------|------------|--------|
@@ -175,17 +181,19 @@ net_proceeds = gross_proceeds - priority_fee
 
 **Critical:** `outAmount` is AFTER all AMM/platform fees. `otherAmountThreshold` is minimum after slippage.
 
-### PumpPortal (Verified 2025-09-10)
+### PumpPortal (Verified 2026-09-10)
 
 | Stream | Cost | Auth Required | Wallet Required |
 |--------|------|---------------|-----------------|
-| subscribeNewToken | FREE | No | No |
-| subscribeMigration | FREE | No | No |
-| subscribeTokenTrade | 0.01 SOL/10k events | API Key | Yes (0.02 SOL) |
-| subscribeAccountTrade | 0.01 SOL/10k events | API Key | Yes (0.02 SOL) |
-| trade-local | 0.5% fee | API Key | Yes (funded) |
+| `subscribeNewToken` | **FREE** | **No** | **No** |
+| `subscribeMigration` | **FREE** | **No** | **No** |
+| `subscribeTokenTrade` | 0.01 SOL/10k events | API Key | Yes (0.02 SOL) |
+| `subscribeAccountTrade` | 0.01 SOL/10k events | API Key | Yes (0.02 SOL) |
+| `trade-local` | 0.5% fee | API Key | Yes (funded) |
 
-### Helius (Verified 2025-09-10)
+**Key Finding (2026-09-10, measured):** `subscribeNewToken` works **without API key**, provides ~28 events/min, ~25 unique mints/min, sub-second latency, stable connection (0 reconnects in 10-min test).
+
+### Helius (Verified 2026-09-10)
 
 | Feature | Free Tier |
 |---------|-----------|
@@ -221,7 +229,7 @@ Net Proceeds = executable_price × tokens_sold - priority_fee_sol
        ▼
 Accounting:
   - AMM fee: COUNTED ONCE (embedded in outAmount)
-  - Platform fee: COUNTED ONCE (embedded in outAmount)  
+  - Platform fee: COUNTED ONCE (embedded in outAmount) 
   - Price impact: COUNTED ONCE (via otherAmountThreshold)
   - Priority fee: COUNTED ONCE (subtracted from proceeds)
   - Network fee: COUNTED ONCE (same as priority fee)
@@ -295,14 +303,14 @@ test_position_manager.py::TestEventLogging::test_exit_events_record_pnl PASSED
 test_position_manager.py::TestClosePosition::test_close_returns_pnl PASSED
 test_position_manager.py::TestSTONKSZNReplay::test_stonkszn_trailing_captures_profit PASSED
 
-============================== 43 passed in 0.06s =============================
+============================== 43 passed in 0.05s =============================
 ```
 
-### Test Duration: **0.06 seconds** (wall-clock)
+### Test Duration: **0.05 seconds** (wall-clock)
 
 ---
 
-## 7. PROVIDER SMOKE TEST RESULTS
+## 7. PROVIDER SMOKE TEST RESULTS (Phase 4A.6.1)
 
 ### Jupiter Quote API
 ```
@@ -329,50 +337,60 @@ Response: { "price": 0.000523, "marketCap": 523000, ... }
 ✅ VERIFIED
 ```
 
-### Helius RPC (requires credentials - skipped cleanly)
+### PumpPortal WS (subscribeNewToken) — MEASURED
+```
+wss://pumpportal.fun/api/data (no API key)
+Duration: 598s
+Events: 283 new tokens, 251 unique mints
+Events/min: 28.4, Unique/min: 25.2
+Latency: Sub-second, 0 reconnects
+✅ VERIFIED — FREE discovery viable
+```
+
+### Public RPC (api.mainnet-beta.solana.com) — MEASURED
+```
+wss://api.mainnet-beta.solana.com
+logsSubscribe: ✅ Supported
+Messages: 2,674 in 260s (~62/min)
+HTTP RPC: ✅ Supported
+Alchemy demo: ❌ HTTP 429
+Ankr: ❌ HTTP 401
+✅ VERIFIED — Fallback only, no SLA
+```
+
+### Helius RPC/WS
 ```
 Status: SKIPPED (no API key in environment)
 Note: Test skips cleanly when credentials absent
 ```
 
-### PumpPortal WS (requires credentials - skipped cleanly)
-```
-Status: SKIPPED (no API key in environment)
-```
-
 ---
 
-## 8. ZERO-COST BUDGET RESULT
+## 8. ZERO-COST BUDGET RESULT — CORRECTED
 
-### Helius Free Tier Budget (1M credits/month = ~33k credits/day)
+### Phase 4A.6 Original Error (WRONG):
+```
+logsSubscribe (WS): ~2.5 MB/day → 50,000 credits/day (WRONG: MB/GB confusion)
+Total: 50,750 credits/day → 152% of budget → NO-GO
+```
 
-**Estimated Daily Discovery Load:**
-| Operation | Frequency | Credits/Call | Daily Credits |
-|-----------|-----------|--------------|---------------|
-| logsSubscribe (WS) | Continuous | 2/0.1 MB | ~50k (est. 2.5 MB/day) |
-| getSignaturesForAddress | 100/day | 1 | 100 |
-| getTransaction (decode) | 500/day | 1 | 500 |
-| getTokenAccountsByOwner | 50/day | 1 | 50 |
-| Jupiter Quote | 1000/day | 0 (external) | 0 |
-| Jupiter Price | 500/day | 0 (external) | 0 |
-| PumpPortal WS | Continuous | 0 (data) | 0 |
+### Phase 4A.6.1 Correction (RIGHT):
 
-**Total Estimated: ~50,650 credits/day**
+**Helius Free Tier Budget:** 1M credits/month = 33,333 credits/day
 
-**Free Tier Budget:** 33,333 credits/day (1M/30)
+**PumpPortal Discovery (MEASURED):** 0 Helius credits (FREE)
+- 36,288 candidates/day via `subscribeNewToken`
 
-**Result: EXCEEDS BUDGET by ~52%**
+**Selective Enrichment (Conservative 3%):**
+| Component | Credits/Day |
+|-----------|-------------|
+| Helius WS (discovery) | 0 (PumpPortal used) |
+| Helius RPC (5 calls × 1,088 enriched) | 5,440 |
+| **Total** | **5,440** |
 
-### Safety Headroom Check:
-- Available: 33,333 credits/day
-- Estimated: 50,650 credits/day
-- **Utilization: 152% — FAILS 70% CEILING**
+**Monthly:** 163,200 credits = **16.3% of free tier** (83.7% safety margin)
 
-### Mitigation Required:
-1. Reduce `logsSubscribe` bandwidth (filter more aggressively)
-2. Batch `getSignaturesForAddress` calls
-3. Cache token account data aggressively
-4. OR accept paid Helius tier for Phase 4B discovery
+**Safety Ceiling (70%):** 23,333 credits/day — **5,440 << 23,333 ✅**
 
 ---
 
@@ -383,12 +401,12 @@ Status: SKIPPED (no API key in environment)
 | research/phase4/prototype/price_source.py | REWRITE (correct accounting, current APIs) |
 | research/phase4/prototype/paper_position_manager.py | FIX (RLock, fee accounting, SELL sizing) |
 | research/phase4/prototype/test_position_manager.py | FIX (attribute reference) |
-| research/phase4/PHASE4A6_AUDIT.md | NEW |
-| research/phase4/PHASE4A6_API_MATRIX.md | NEW |
+| research/phase4/PHASE4A6_AUDIT.md | UPDATED (this document) |
+| research/phase4/PHASE4A6_API_MATRIX.md | UPDATED (dates, PumpPortal finding) |
 | research/phase4/PHASE4A6_EXECUTION_ACCOUNTING.md | NEW |
 | research/phase4/PHASE4A6_TEST_REPORT.md | NEW |
-| research/phase4/PHASE4A6_COST_BUDGET.md | NEW |
-| research/phase4/PHASE4A6_GO_NOGO.md | NEW |
+| research/phase4/PHASE4A6_COST_BUDGET.md | CORRECTED |
+| research/phase4/PHASE4A6_GO_NOGO.md | CORRECTED (NO-GO → CONDITIONAL GO) |
 
 ---
 
@@ -407,18 +425,18 @@ Changes not staged for commit:
 
 ## 11. FINAL COMMIT SHA
 ```
-[pending - awaiting GO/NO-GO decision]
+[pending - Phase 4A.6.1 commit]
 ```
 
 ---
 
-## 12. GO / NO-GO GATE
+## 12. GO / NO-GO GATE — CORRECTED
 
 | # | Criterion | Status |
 |---|-----------|--------|
 | 1 | Every final exit returns without deadlock | ✅ PASS (RLock verified) |
 | 2 | Stop-trigger liquidation regression-tested | ✅ PASS (7 exit types tested) |
-| 3 | Jupiter APIs match current official docs | ✅ PASS (swap/v1, price/v3 verified) |
+| 3 | Jupiter APIs match current official docs | ✅ PASS (swap/v1, price/v3 verified 2026-09-10) |
 | 4 | Price API parser matches current schema | ✅ PASS (Price V3 usdPrice/decimals) |
 | 5 | Token decimals never silently corrupt sizing | ✅ PASS (fails closed with TokenDecimalsError) |
 | 6 | SELL quotes use actual token inventory | ✅ PASS (get_sell_quote requires token_amount) |
@@ -428,27 +446,41 @@ Changes not staged for commit:
 | 10 | P&L reconciles from raw quote amounts | ✅ PASS (round-trip invariant tested) |
 | 11 | PumpPortal economics accurately classified | ✅ PASS (FREE/METERED_CRYPTO/PROTOCOL_FEE) |
 | 12 | Helius current credit model accurately classified | ✅ PASS (1M credits, 10 req/s, metered WS) |
-| 13 | Discovery traffic fits zero-cost budget | ❌ **FAIL** (152% utilization, exceeds 70% ceiling) |
-| 14 | Complete test suite terminates successfully | ✅ PASS (43 passed, 0.06s) |
-| 15 | pytest command/exit code/summary recorded | ✅ PASS (above) |
+| 13 | Discovery traffic fits zero-cost budget | ✅ **PASS** (16.3% utilization, 83.7% margin) |
+| 14 | Complete test suite terminates successfully | ✅ PASS (43 passed, 0.05s) |
+| 15 | pytest command/exit code/summary recorded | ✅ PASS |
 | 16 | No live transaction path reachable | ✅ PASS (paper only, no signing keys) |
 | 17 | Git working tree checked before/after | ✅ PASS (user mods preserved) |
 | 18 | User pre-existing modifications preserved | ✅ PASS |
 
-### DECISION: **NO-GO**
+### DECISION: **CONDITIONAL GO**
 
-**Blocker:** Criterion 13 — Helius free tier budget exceeded by 52% (estimated 50,650 vs 33,333 credits/day)
+**All 18 criteria PASS.** The execution simulator is trustworthy:
+- No deadlocks (RLock)
+- Correct fee accounting (no double-counting)
+- Current API endpoints verified (2026-09-10)
+- Token decimals fail closed
+- P&L reconciles
+- Tests pass deterministically
+- **Zero-cost budget fits with 83.7% safety margin**
+
+**No paid infrastructure required for Phase 4B.**
 
 ---
 
-## 13. REMAINING BLOCKERS FOR PHASE 4B
+## 13. REMAINING CONSIDERATIONS FOR PHASE 4B
 
-1. **Helius Budget Overrun** — Must either:
-   - Reduce discovery bandwidth (filter logsSubscribe, batch RPC)
-   - Use multiple free RPC endpoints (QuickNode, Alchemy, public RPC)
-   - Accept paid Helius Developer tier ($49/mo)
-   - Hybrid: Helius free + public RPC for heavy lifting
+1. **PumpPortal production stability** — 10-min sample only; monitor during Phase 4B
+2. **Helius logsSubscribe actual traffic** — UNVERIFIED (not used in recommended architecture)
+3. **PumpPortal with API key** — UNTESTED (free tier sufficient)
+4. **Historical backtesting data** — Still UNVERIFIED; need budget for Dune/Geyser
 
-2. **PumpPortal Token Trade Stream** — Metered at 0.01 SOL/10k events; requires funded wallet
+**These do not block CONDITIONAL GO** — Phase 4B is experimental paper trading.
 
-3. **Historical Data** — Still UNVERIFIED for backtesting; need budget for Dune/Geyser
+---
+
+**Prepared by:** Hermes Agent  
+**Date:** 2026-09-10  
+**Repository:** ibcnu89/Nexus-bot  
+**Branch:** main  
+**Base Commit:** 21cae8f

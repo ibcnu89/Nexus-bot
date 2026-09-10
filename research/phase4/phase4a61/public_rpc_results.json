@@ -1,0 +1,47 @@
+[
+  {
+    "endpoint": "wss://api.mainnet-beta.solana.com",
+    "ws_supported": true,
+    "ws_connect_time_ms": 2541.879415512085,
+    "logs_subscribe_supported": true,
+    "logs_subscribe_time_ms": 60.091257095336914,
+    "messages_received": 2674,
+    "disconnect_after_seconds": null,
+    "http_supported": true,
+    "http_get_health_ms": 2374.201774597168,
+    "http_get_slot_ms": 82.02743530273438,
+    "http_get_signatures_ms": 165.7545566558838,
+    "rate_limit_observed": false,
+    "notes": ""
+  },
+  {
+    "endpoint": "wss://solana-mainnet.g.alchemy.com/v2/demo",
+    "ws_supported": false,
+    "ws_connect_time_ms": 0,
+    "logs_subscribe_supported": false,
+    "logs_subscribe_time_ms": 0,
+    "messages_received": 0,
+    "disconnect_after_seconds": null,
+    "http_supported": false,
+    "http_get_health_ms": 532.8757762908936,
+    "http_get_slot_ms": 34.15822982788086,
+    "http_get_signatures_ms": 33.3859920501709,
+    "rate_limit_observed": true,
+    "notes": " WS error: server rejected WebSocket connection: HTTP 429 Rate limit: 10/10 errors"
+  },
+  {
+    "endpoint": "wss://rpc.ankr.com/solana_ws",
+    "ws_supported": false,
+    "ws_connect_time_ms": 0,
+    "logs_subscribe_supported": false,
+    "logs_subscribe_time_ms": 0,
+    "messages_received": 0,
+    "disconnect_after_seconds": null,
+    "http_supported": false,
+    "http_get_health_ms": 117.54012107849121,
+    "http_get_slot_ms": 32.11212158203125,
+    "http_get_signatures_ms": 32.77158737182617,
+    "rate_limit_observed": false,
+    "notes": " WS error: server rejected WebSocket connection: HTTP 401"
+  }
+]
