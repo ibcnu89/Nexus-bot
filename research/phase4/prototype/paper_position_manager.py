@@ -5,12 +5,13 @@ This module implements a complete paper trading position manager with:
 - Initial stop loss
 - Trailing stop with ratcheting (never loosens)
 - Break-even protection
-- Scaled take profits (partial exits)
+- Scaled take profits (partial exits with proper accounting)
 - Time-based exits
 - Liquidity collapse exits
 - Sell pressure exits
 - Executable price realism (Jupiter quotes + slippage + fees)
 - Append-only JSONL event logging
+- Full P&L accounting with realized/unrealized tracking
 
 All exits are evaluated against realistic executable prices, not headline prices.
 """
@@ -21,6 +22,7 @@ import json
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
+from decimal import Decimal
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -96,6 +98,9 @@ class ExitConfig:
             raise ValueError("breakeven_trigger_pct must be positive")
         if self.breakeven_floor_pct < 0:
             raise ValueError("breakeven_floor_pct must be non-negative")
+        total_exit_fraction = sum(f for _, f in self.take_profit_levels)
+        if total_exit_fraction > 1.0:
+            raise ValueError("take_profit exit fractions sum to > 100%")
         for trigger, fraction in self.take_profit_levels:
             if trigger <= 0:
                 raise ValueError("take_profit trigger must be positive")
@@ -133,6 +138,9 @@ class PriceQuote:
     in_amount: float                # Input amount
     route: str                      # Route description
     timestamp: float = field(default_factory=time.time)
+    swap_fee_bps: int = 0           # DEX swap fee in basis points
+    platform_fee_bps: int = 0       # Platform fee in basis points
+    priority_fee_sol: float = 0.0   # Priority fee in SOL
 
     @property
     def executable_price(self) -> float:
@@ -141,11 +149,11 @@ class PriceQuote:
 
     @property
     def net_price_after_fees(self) -> float:
-        """Price after DEX fees (0.25% typical) and priority fee."""
-        # Priority fee is per transaction, not per token - approximate as price reduction
-        # For small positions, priority fee has larger relative impact
-        dex_fee_pct = 0.0025  # 0.25% Raydium fee
-        return self.executable_price * (1 - dex_fee_pct)
+        """Price after DEX fees and priority fee."""
+        dex_fee_pct = self.swap_fee_bps / 10000.0
+        platform_fee_pct = self.platform_fee_bps / 10000.0
+        total_fee_pct = dex_fee_pct + platform_fee_pct
+        return self.executable_price * (1 - total_fee_pct)
 
 
 @dataclass
@@ -167,6 +175,13 @@ class PositionEvent:
     estimated_exit_price: float = 0.0
     estimated_net_pnl_pct: float = 0.0
     remaining_fraction: float = 1.0
+    # P&L accounting fields
+    tokens_remaining: float = 0.0
+    realized_proceeds_sol: float = 0.0
+    realized_pnl_sol: float = 0.0
+    unrealized_pnl_sol: float = 0.0
+    fees_paid_sol: float = 0.0
+    weighted_exit_price: float = 0.0
 
     def to_jsonl(self) -> str:
         return json.dumps(asdict(self), separators=(',', ':'))
@@ -183,7 +198,8 @@ class PaperPosition:
     config: ExitConfig
 
     # Derived state
-    token_amount: float = field(init=False)
+    initial_token_amount: float = field(init=False)  # Total tokens bought at entry
+    tokens_remaining: float = field(init=False)      # Tokens still held
     state: PositionState = field(default=PositionState.OPEN, init=False)
 
     # Exit tracking
@@ -192,6 +208,12 @@ class PaperPosition:
     breakeven_stop_price: Optional[float] = field(default=None, init=False)
     high_water_mark: float = field(init=False)
     take_profit_levels_hit: list[bool] = field(default_factory=list, init=False)
+
+    # P&L Accounting
+    realized_proceeds_sol: float = field(default=0.0, init=False)  # SOL received from partial exits
+    realized_pnl_sol: float = field(default=0.0, init=False)       # Realized P&L from exits
+    fees_paid_sol: float = field(default=0.0, init=False)          # Total fees paid
+    weighted_exit_price: float = field(default=0.0, init=False)    # Volume-weighted average exit price
 
     # Volume tracking for sell pressure
     recent_buy_volume: float = field(default=0.0, init=False)
@@ -206,10 +228,12 @@ class PaperPosition:
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self):
-        self.token_amount = self.size_sol / self.entry_price
+        self.initial_token_amount = self.size_sol / self.entry_price
+        self.tokens_remaining = self.initial_token_amount
         self.initial_stop_price = self.entry_price * (1 + self.config.initial_stop_pct)
         self.high_water_mark = self.entry_price
         self.take_profit_levels_hit = [False] * len(self.config.take_profit_levels)
+        self.take_profit_levels_executed = [False] * len(self.config.take_profit_levels)
         self.peak_liquidity_usd = 0.0
         self._last_high_time = self.entry_time
         self._log_event(
@@ -222,10 +246,92 @@ class PaperPosition:
             sell_volume=0.0,
             position_value_sol=self.size_sol,
             stop_level=self.initial_stop_price,
+            tokens_remaining=self.tokens_remaining,
+            realized_proceeds_sol=0.0,
+            realized_pnl_sol=0.0,
+            unrealized_pnl_sol=0.0,
+            fees_paid_sol=0.0,
+            weighted_exit_price=0.0,
         )
 
     def _log_event(self, **kwargs) -> None:
         """Append event to log."""
+        event = PositionEvent(
+            ts=datetime.now(timezone.utc).isoformat(),
+            mint=self.mint,
+            **kwargs
+        )
+        self.events.append(event)
+
+    def _get_unrealized_pnl(self, current_price: float) -> float:
+        """Calculate unrealized P&L based on current price."""
+        return self.tokens_remaining * (current_price - self.entry_price)
+
+    def _get_total_pnl(self, current_price: float) -> float:
+        """Calculate total P&L = realized + unrealized."""
+        return self.realized_pnl_sol + self._get_unrealized_pnl(current_price)
+
+    def _execute_partial_exit(
+        self,
+        exit_fraction: float,
+        exit_price: float,
+        quote: Optional[PriceQuote],
+        trigger: ExitTrigger
+    ) -> tuple[float, float, float]:
+        """
+        Execute a partial exit.
+
+        Returns:
+            (tokens_sold, proceeds_sol, fees_sol)
+        """
+        # Calculate tokens to sell (fraction of ORIGINAL position, not remaining)
+        tokens_to_sell = self.initial_token_amount * exit_fraction
+        tokens_to_sell = min(tokens_to_sell, self.tokens_remaining)
+
+        if tokens_to_sell <= 0:
+            return 0.0, 0.0, 0.0
+
+        # Get net price after fees from quote
+        net_price = quote.net_price_after_fees if quote else exit_price
+
+        # Calculate proceeds and fees
+        gross_proceeds = tokens_to_sell * net_price
+
+        # Priority fee
+        priority_fee = quote.priority_fee_sol if quote else self.config.priority_fee_sol
+
+        # DEX + platform fees already embedded in net_price
+        # Track fees separately
+        fees = priority_fee
+
+        # Net proceeds after priority fee
+        net_proceeds = gross_proceeds - fees
+
+        # Update accounting
+        self.tokens_remaining -= tokens_to_sell
+        self.realized_proceeds_sol += net_proceeds
+        self.fees_paid_sol += fees
+
+        # Update weighted exit price
+        if self.weighted_exit_price == 0.0:
+            self.weighted_exit_price = net_price
+        else:
+            total_sold = self.initial_token_amount - self.tokens_remaining
+            if total_sold > 0:
+                # Recalculate weighted average
+                self.weighted_exit_price = (
+                    (self.weighted_exit_price * (total_sold - tokens_to_sell) + net_price * tokens_to_sell)
+                    / total_sold
+                )
+
+        # Realized P&L for this exit
+        exit_pnl = tokens_to_sell * (net_price - self.entry_price) - fees
+        self.realized_pnl_sol += exit_pnl
+
+        return tokens_to_sell, net_proceeds, fees
+
+    def _log_event(self, **kwargs) -> None:
+        """Append event to log with current P&L state."""
         event = PositionEvent(
             ts=datetime.now(timezone.utc).isoformat(),
             mint=self.mint,
@@ -272,7 +378,7 @@ class PaperPosition:
             # Use executable price for exit evaluation
             eval_price = quote.net_price_after_fees if quote else price
 
-            # 1. Check initial stop loss (always active until trailing activates)
+            # 1. Check initial stop loss (always active)
             if self.state in (PositionState.OPEN, PositionState.TRAILING_ACTIVE, PositionState.BREAKEVEN_SECURED, PositionState.PARTIAL_EXIT):
                 if eval_price <= self.initial_stop_price:
                     triggers.append(ExitTrigger.INITIAL_STOP)
@@ -324,7 +430,29 @@ class PaperPosition:
             if new_high:
                 self._update_stops_on_new_high(price)
 
-            # Determine if we should close fully or just partial
+            # Execute take profit exits immediately
+            executed_exits = []
+            for i, (trigger_pct, exit_fraction) in enumerate(self.config.take_profit_levels):
+                if self.take_profit_levels_hit[i]:
+                    # Check if we just hit this level (not already executed)
+                    # We track this via a separate flag or by checking if we already executed
+                    pass
+                    # We'll handle execution in the trigger processing below
+
+            # Process take profit exits
+            for i, (trigger_pct, exit_fraction) in enumerate(self.config.take_profit_levels):
+                if self.take_profit_levels_hit[i] and not self.take_profit_levels_executed[i]:
+                    target_price = self.entry_price * (1 + trigger_pct)
+                    if eval_price >= target_price:
+                        # Execute this partial exit
+                        tokens_sold, proceeds, fees = self._execute_partial_exit(
+                            exit_fraction, eval_price, quote, ExitTrigger.TAKE_PROFIT
+                        )
+                        if tokens_sold > 0:
+                            executed_exits.append((i, tokens_sold, proceeds, fees))
+                            self.take_profit_levels_executed[i] = True
+
+            # Determine if we should close fully
             is_final_exit = any(t in (
                 ExitTrigger.INITIAL_STOP,
                 ExitTrigger.TRAILING_STOP,
@@ -335,6 +463,9 @@ class PaperPosition:
             ) for t in triggers)
 
             # Log the update
+            unrealized_pnl = self._get_unrealized_pnl(eval_price)
+            total_pnl = self.realized_pnl_sol + unrealized_pnl
+
             self._log_event(
                 event="UPDATE" if not triggers else ("EXIT_TRIGGERED" if is_final_exit else "PARTIAL_EXIT"),
                 price=price,
@@ -344,24 +475,28 @@ class PaperPosition:
                 buy_volume=buy_volume,
                 sell_volume=sell_volume,
                 trigger=triggers[0].value if triggers else None,
-                position_value_sol=self.token_amount * eval_price,
+                position_value_sol=self.tokens_remaining * eval_price + self.realized_proceeds_sol,
                 high_water_mark=self.high_water_mark,
                 stop_level=self.trailing_stop_price or self.breakeven_stop_price or self.initial_stop_price,
                 estimated_exit_price=eval_price,
-                estimated_net_pnl_pct=(eval_price / self.entry_price - 1) * 100,
-                remaining_fraction=self._get_remaining_fraction(),
+                estimated_net_pnl_pct=(total_pnl / self.size_sol) * 100 if self.size_sol > 0 else 0,
+                remaining_fraction=self.tokens_remaining / self.initial_token_amount if self.initial_token_amount > 0 else 0,
+                tokens_remaining=self.tokens_remaining,
+                realized_proceeds_sol=self.realized_proceeds_sol,
+                realized_pnl_sol=self.realized_pnl_sol,
+                unrealized_pnl_sol=unrealized_pnl,
+                fees_paid_sol=self.fees_paid_sol,
+                weighted_exit_price=self.weighted_exit_price,
             )
 
+            # Execute final exit if needed
             if is_final_exit:
-                self.state = PositionState.CLOSED
-            elif triggers and ExitTrigger.TAKE_PROFIT in triggers:
-                self.state = PositionState.PARTIAL_EXIT
+                self.close_position(eval_price, triggers[0], quote)
 
         return triggers
 
     def _update_stops_on_new_high(self, new_high_price: float) -> None:
         """Update trailing and breakeven stops when new high is reached."""
-        # Use epsilon for floating point comparison
         eps = 1e-12
 
         # Trailing stop activation
@@ -380,8 +515,14 @@ class PaperPosition:
                     high_water_mark=self.high_water_mark,
                     stop_level=self.trailing_stop_price,
                     estimated_exit_price=new_trailing,
-                    estimated_net_pnl_pct=(new_trailing / self.entry_price - 1) * 100,
-                    remaining_fraction=self._get_remaining_fraction(),
+                    estimated_net_pnl_pct=((new_trailing / self.entry_price - 1) * 100),
+                    remaining_fraction=self.tokens_remaining / self.initial_token_amount,
+                    tokens_remaining=self.tokens_remaining,
+                    realized_proceeds_sol=self.realized_proceeds_sol,
+                    realized_pnl_sol=self.realized_pnl_sol,
+                    unrealized_pnl_sol=self._get_unrealized_pnl(new_high_price),
+                    fees_paid_sol=self.fees_paid_sol,
+                    weighted_exit_price=self.weighted_exit_price,
                 )
             elif new_trailing > self.trailing_stop_price + eps:
                 # RATCHET: Only tighten, never loosen
@@ -396,8 +537,14 @@ class PaperPosition:
                     high_water_mark=self.high_water_mark,
                     stop_level=self.trailing_stop_price,
                     estimated_exit_price=new_trailing,
-                    estimated_net_pnl_pct=(new_trailing / self.entry_price - 1) * 100,
-                    remaining_fraction=self._get_remaining_fraction(),
+                    estimated_net_pnl_pct=((new_trailing / self.entry_price - 1) * 100),
+                    remaining_fraction=self.tokens_remaining / self.initial_token_amount,
+                    tokens_remaining=self.tokens_remaining,
+                    realized_proceeds_sol=self.realized_proceeds_sol,
+                    realized_pnl_sol=self.realized_pnl_sol,
+                    unrealized_pnl_sol=self._get_unrealized_pnl(new_high_price),
+                    fees_paid_sol=self.fees_paid_sol,
+                    weighted_exit_price=self.weighted_exit_price,
                 )
 
         # Break-even protection
@@ -414,24 +561,45 @@ class PaperPosition:
                 high_water_mark=self.high_water_mark,
                 stop_level=self.breakeven_stop_price,
                 estimated_exit_price=self.breakeven_stop_price,
-                estimated_net_pnl_pct=(self.breakeven_stop_price / self.entry_price - 1) * 100,
-                remaining_fraction=self._get_remaining_fraction(),
+                estimated_net_pnl_pct=((self.breakeven_stop_price / self.entry_price - 1) * 100),
+                remaining_fraction=self.tokens_remaining / self.initial_token_amount,
+                tokens_remaining=self.tokens_remaining,
+                realized_proceeds_sol=self.realized_proceeds_sol,
+                realized_pnl_sol=self.realized_pnl_sol,
+                unrealized_pnl_sol=self._get_unrealized_pnl(new_high_price),
+                fees_paid_sol=self.fees_paid_sol,
+                weighted_exit_price=self.weighted_exit_price,
             )
 
-    def _get_remaining_fraction(self) -> float:
-        """Calculate remaining position fraction after partial exits."""
-        remaining = 1.0
-        for i, (_, exit_fraction) in enumerate(self.config.take_profit_levels):
-            if self.take_profit_levels_hit[i]:
-                remaining -= exit_fraction
-        return max(0.0, remaining)
+    def _get_unrealized_pnl(self, current_price: float) -> float:
+        """Calculate unrealized P&L based on current price."""
+        return self.tokens_remaining * (current_price - self.entry_price)
 
     def close_position(self, exit_price: float, trigger: ExitTrigger, quote: Optional[PriceQuote] = None) -> dict:
         """Close position and return final P&L."""
         with self._lock:
             net_price = quote.net_price_after_fees if quote else exit_price
-            gross_pnl_pct = (net_price / self.entry_price - 1) * 100
-            net_pnl_sol = self.token_amount * (net_price - self.entry_price)
+            final_price = net_price
+
+            # Sell remaining tokens
+            if self.tokens_remaining > 0:
+                gross_proceeds = self.tokens_remaining * final_price
+
+                # Fees
+                priority_fee = quote.priority_fee_sol if quote else self.config.priority_fee_sol
+                fees = priority_fee
+
+                net_proceeds = gross_proceeds - fees
+
+                self.realized_proceeds_sol += net_proceeds
+                self.fees_paid_sol += fees
+
+                exit_pnl = self.tokens_remaining * (final_price - self.entry_price) - fees
+                self.realized_pnl_sol += exit_pnl
+                self.tokens_remaining = 0.0
+
+            total_pnl = self.realized_pnl_sol
+            total_pnl_pct = (total_pnl / self.size_sol) * 100 if self.size_sol > 0 else 0
 
             self._log_event(
                 event="SIMULATED_FILL",
@@ -439,12 +607,18 @@ class PaperPosition:
                 liquidity_usd=0, market_cap_usd=0, volume_24h_usd=0,
                 buy_volume=0, sell_volume=0,
                 trigger=trigger.value,
-                position_value_sol=self.token_amount * net_price,
+                position_value_sol=self.realized_proceeds_sol,
                 high_water_mark=self.high_water_mark,
-                stop_level=net_price,
-                estimated_exit_price=net_price,
-                estimated_net_pnl_pct=gross_pnl_pct,
+                stop_level=final_price,
+                estimated_exit_price=final_price,
+                estimated_net_pnl_pct=total_pnl_pct,
                 remaining_fraction=0.0,
+                tokens_remaining=0.0,
+                realized_proceeds_sol=self.realized_proceeds_sol,
+                realized_pnl_sol=self.realized_pnl_sol,
+                unrealized_pnl_sol=0.0,
+                fees_paid_sol=self.fees_paid_sol,
+                weighted_exit_price=self.weighted_exit_price,
             )
 
             self._log_event(
@@ -455,10 +629,16 @@ class PaperPosition:
                 trigger=trigger.value,
                 position_value_sol=0.0,
                 high_water_mark=self.high_water_mark,
-                stop_level=net_price,
-                estimated_exit_price=net_price,
-                estimated_net_pnl_pct=gross_pnl_pct,
+                stop_level=final_price,
+                estimated_exit_price=final_price,
+                estimated_net_pnl_pct=total_pnl_pct,
                 remaining_fraction=0.0,
+                tokens_remaining=0.0,
+                realized_proceeds_sol=self.realized_proceeds_sol,
+                realized_pnl_sol=self.realized_pnl_sol,
+                unrealized_pnl_sol=0.0,
+                fees_paid_sol=self.fees_paid_sol,
+                weighted_exit_price=self.weighted_exit_price,
             )
 
             self.state = PositionState.CLOSED
@@ -467,18 +647,49 @@ class PaperPosition:
                 "mint": self.mint,
                 "symbol": self.symbol,
                 "entry_price": self.entry_price,
-                "exit_price": net_price,
-                "gross_pnl_pct": gross_pnl_pct,
-                "net_pnl_sol": net_pnl_sol,
+                "exit_price": final_price,
+                "gross_pnl_pct": total_pnl_pct,
+                "net_pnl_sol": total_pnl,
                 "hold_time_seconds": time.time() - self.entry_time,
                 "trigger": trigger.value,
                 "high_water_mark": self.high_water_mark,
                 "events_count": len(self.events),
+                "realized_proceeds_sol": self.realized_proceeds_sol,
+                "realized_pnl_sol": self.realized_pnl_sol,
+                "fees_paid_sol": self.fees_paid_sol,
+                "weighted_exit_price": self.weighted_exit_price,
+                "initial_token_amount": self.initial_token_amount,
             }
+
+    def _get_remaining_fraction(self) -> float:
+        """Calculate remaining position fraction after partial exits (for backward compat)."""
+        if self.initial_token_amount <= 0:
+            return 0.0
+        return max(0.0, self.tokens_remaining / self.initial_token_amount)
 
     def get_events_jsonl(self) -> str:
         """Get all events as JSONL string."""
         return "\n".join(e.to_jsonl() for e in self.events)
+
+    def get_pnl_summary(self, current_price: float) -> dict:
+        """Get current P&L summary."""
+        unrealized = self._get_unrealized_pnl(current_price)
+        realized = self.realized_pnl_sol
+        total = realized + unrealized
+        return {
+            "initial_token_amount": self.initial_token_amount,
+            "tokens_remaining": self.tokens_remaining,
+            "tokens_sold": self.initial_token_amount - self.tokens_remaining,
+            "entry_price": self.entry_price,
+            "current_price": current_price,
+            "weighted_exit_price": self.weighted_exit_price,
+            "unrealized_pnl_sol": unrealized,
+            "realized_pnl_sol": realized,
+            "total_pnl_sol": total,
+            "fees_paid_sol": self.fees_paid_sol,
+            "realized_proceeds_sol": self.realized_proceeds_sol,
+            "total_pnl_pct": (total / self.size_sol) * 100 if self.size_sol > 0 else 0,
+        }
 
 
 class EventLogger:

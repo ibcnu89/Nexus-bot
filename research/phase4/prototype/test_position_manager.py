@@ -52,7 +52,7 @@ class TestExitConfigValidation:
             ExitConfig(trail_distance_pct=1.5)
 
     def test_invalid_take_profit_fraction(self):
-        with pytest.raises(ValueError, match="take_profit fraction must be in"):
+        with pytest.raises(ValueError, match="take_profit exit fractions sum to > 100%"):
             ExitConfig(take_profit_levels=[(0.50, 1.5)])
 
     def test_take_profit_ordering(self):
@@ -94,7 +94,8 @@ class TestPaperPositionBasics:
         assert self.position.symbol == "TEST"
         assert self.position.entry_price == 0.0005
         assert self.position.size_sol == 0.1
-        assert self.position.token_amount == 200  # 0.1 / 0.0005
+        assert self.position.initial_token_amount == 200  # 0.1 / 0.0005
+        assert self.position.tokens_remaining == 200
         assert self.position.state == PositionState.OPEN
         assert self.position.initial_stop_price == 0.000375  # 0.0005 * 0.75
 

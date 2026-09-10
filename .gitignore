@@ -1,18 +1,31 @@
 # Python
+venv/
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-venv/
-env/
-.env
+pip-log.txt
+pip-delete-this-directory.txt
 
-# IDE
+# Environment & Secrets
+.env
+.env.local
+*.env
+alpaca_key.txt
+alpaca_secret.txt
+fomo_key.txt
+web_user.json
+
+# IDE/Editor
 .vscode/
 .idea/
 *.swp
 *.swo
+
+# OS
+.DS_Store
+Thumbs.db
 
 # Phase 3 large files (not committed)
 research/phase3b/result_*.json
@@ -22,6 +35,36 @@ research/phase3b/phase3b_complete_results.json
 logs/
 *.log
 
-# OS
-.DS_Store
-Thumbs.db
+# Build artifacts
+*.egg-info/
+dist/
+build/
+
+# Test coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Local data directories
+BNB/
+DOGE/
+ETH/
+PAXG/
+SOL/
+XRP/
+hub_data/
+*.txt
+!requirements.txt
+!README.md
+!LICENSE
+
+# GUI settings (contains user preferences)
+gui_settings.json
+trainer_status.json
+alerts_version.txt
+futures_long_onoff.txt
+futures_long_profit_margin.txt
+futures_short_onoff.txt
+futures_short_profit_margin.txt
+long_dca_signal.txt
+short_dca_signal.txt
