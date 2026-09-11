@@ -31,6 +31,9 @@ from research.phase4.phase4b.discovery.pumpportal import (
     PumpPortalDiscovery, SolanaPublicRPCDiscovery, DiscoveryManager
 )
 from research.phase4.phase4b.scoring.pre_score import PreScorer
+from research.phase4.phase4b.scoring.meta_engine import MetaEngine
+from research.phase4.phase4b.risk.rug_detector import RugDetector
+from research.phase4.phase4b.narrative.narrative_engine import NarrativeEngine
 from research.phase4.phase4b.enrichment.helius import (
     HeliusClient, CreditGovernor, TTLCache, EnrichmentPipeline
 )
@@ -301,6 +304,14 @@ class Phase4BPipeline:
             position_size_sol=self.config.position_size_sol,
         )
 
+        # Risk detector
+        from research.phase4.phase4b.risk.rug_detector import RugDetector
+        self.rug_detector = RugDetector()
+
+        # Meta engine
+        from research.phase4.phase4b.scoring.meta_engine import MetaEngine
+        self.meta_engine = MetaEngine()
+
         # Discovery manager
         self.discovery_manager = DiscoveryManager(
             queue=self.discovery_queue,
@@ -490,47 +501,34 @@ class Phase4BPipeline:
             logger.error(f"Enrichment batch failed: {e}")
 
     async def _process_risk_analysis(self) -> None:
-        """Analyze risk for enriched candidates."""
-        # TODO: Implement risk analysis using enrichment data
-        # For now, use a simple placeholder
-        if not self.discovery_queue:
+        """Analyze risk for enriched candidates using real rug detector."""
+        if not self.discovery_queue or not self.rug_detector:
             return
 
         enriched = [c for c in self.discovery_queue.get_all()
                    if c.enrichment_status == "completed" and c.risk_score == 0.0]
 
         for candidate in enriched:
-            # Simple risk assessment based on available data
-            risk_score = 0
-            risk_reasons = []
+            # Use real rug detector
+            enrichment_data = getattr(candidate, 'enrichment_data', {})
+            discovery_event = candidate.discovery_event
+            
+            assessment = self.rug_detector.assess(enrichment_data, discovery_event)
+            
+            candidate.risk_score = assessment.risk_score
+            candidate.risk_class = assessment.risk_class
+            candidate.risk_reasons = assessment.risk_reasons
+            candidate.risk_component_scores = assessment.component_scores
+            candidate.risk_confidence = assessment.confidence
+            candidate.missing_data_indicators = assessment.missing_data_indicators
 
-            # Check for obvious risk indicators
-            if candidate.discovery_event:
-                event = candidate.discovery_event
-                if event.get("freeze_authority_active"):
-                    risk_score += 50
-                    risk_reasons.append("freeze_authority_active")
-                if event.get("creator_holdings_pct", 0) > 50:
-                    risk_score += 30
-                    risk_reasons.append("creator_holds_excessive")
-                if event.get("top_10_holders_pct", 0) > 80:
-                    risk_score += 25
-                    risk_reasons.append("top_10_concentrated")
-
-            candidate.risk_score = min(risk_score, 100)
-            candidate.risk_reasons = risk_reasons
-
-            if risk_score >= 70:
-                candidate.risk_class = "REJECT"
+            if assessment.risk_class == "REJECT":
                 self.stats.risk_rejected += 1
-            elif risk_score >= 40:
-                candidate.risk_class = "HIGH"
+            elif assessment.risk_class == "HIGH":
                 self.stats.risk_high += 1
-            elif risk_score >= 20:
-                candidate.risk_class = "MODERATE"
+            elif assessment.risk_class == "MODERATE":
                 self.stats.risk_moderate += 1
             else:
-                candidate.risk_class = "LOW"
                 self.stats.risk_low += 1
 
             # Persist risk score
@@ -538,7 +536,7 @@ class Phase4BPipeline:
 
     async def _process_meta_decisions(self) -> None:
         """Make meta-scoring decisions for risk-passed candidates."""
-        if not self.discovery_queue:
+        if not self.discovery_queue or not self.meta_engine:
             return
 
         # Get candidates that passed risk and are ready for meta decision
@@ -549,41 +547,50 @@ class Phase4BPipeline:
                 and not c.meta_approved]
 
         for candidate in ready:
-            # Simple meta scoring
-            meta_score = 0
+            # Use real meta engine
+            # We need to derive inputs from candidate data
+            discovery_quality = candidate.pre_score * 100
+            
+            onchain_quality = 50.0  # default
+            if hasattr(candidate, 'enrichment_data') and candidate.enrichment_data:
+                onchain_quality = 75.0
+            
+            liquidity_execution = 50.0  # placeholder - needs actual liquidity data
+            
+            narrative_momentum = 50.0  # placeholder - needs narrative engine
+            
+            creator_quality = candidate.pre_score * 100
+            
+            risk_score = int(candidate.risk_score)
+            risk_class = candidate.risk_class
+            
+            meta_result = self.meta_engine.evaluate(
+                discovery_quality=discovery_quality,
+                onchain_quality=onchain_quality,
+                liquidity_execution=liquidity_execution,
+                narrative_momentum=narrative_momentum,
+                creator_quality=creator_quality,
+                risk_score=risk_score,
+                risk_class=risk_class,
+                narrative_confidence=0.5,
+                enrichment_completeness=1.0 if candidate.enrichment_status == "completed" else 0.0,
+                quote_quality=0.5,
+            )
 
-            # Discovery quality (0-20)
-            meta_score += min(candidate.pre_score * 20, 20)
+            candidate.meta_score = meta_result["meta_score"]
+            candidate.meta_confidence = meta_result["confidence"]
+            candidate.meta_decision = meta_result["decision"]
+            candidate.meta_rejection_reason = meta_result.get("rejection_reason", "")
+            candidate.meta_component_breakdown = meta_result.get("component_breakdown", {})
+            candidate.recommended_size_sol = meta_result.get("recommended_size_sol", 0.02)
+            candidate.calibration = meta_result.get("calibration", "EMPIRICAL_UNCALIBRATED")
 
-            # On-chain quality (0-25) - based on enrichment
-            if candidate.enrichment_status == "completed":
-                meta_score += 20
-
-            # Liquidity (0-20) - placeholder
-            meta_score += 10
-
-            # Narrative (0-20) - placeholder
-            meta_score += 5
-
-            # Creator quality (0-15) - based on pre-score
-            meta_score += min(candidate.pre_score * 15, 15)
-
-            # Risk penalty
-            risk_penalty = candidate.risk_score * 1.5
-            meta_score = max(0, meta_score - risk_penalty)
-
-            candidate.meta_score = min(meta_score, 100)
-            candidate.meta_confidence = 0.5  # placeholder
-
-            # Decision threshold
-            if meta_score >= 50:
+            if meta_result["decision"] == "approve":
                 candidate.meta_approved = True
                 self.stats.meta_approved += 1
-                candidate.rejection_reason = ""
             else:
                 candidate.meta_approved = False
                 self.stats.meta_rejected += 1
-                candidate.rejection_reason = f"Meta score {meta_score:.1f} below threshold"
 
             await self._persist_meta_decision(candidate)
 
@@ -602,12 +609,14 @@ class Phase4BPipeline:
                 logger.warning("Position limit reached, skipping entry")
                 break
 
-            # Create entry intent
+            # Create entry intent - use recommended size from meta engine
+            position_size = getattr(candidate, 'recommended_size_sol', self.config.position_size_sol)
+            
             intent = EntryIntent(
                 mint=candidate.mint,
                 symbol=candidate.symbol,
-                size_sol=0.02,  # Fixed position size
-                entry_price_hint=candidate.pre_score,  # placeholder
+                size_sol=position_size,
+                entry_price_hint=0.0,  # Will be filled by actual execution quote
                 max_slippage_bps=50,
                 max_priority_fee_sol=0.0005,
             )
@@ -618,15 +627,25 @@ class Phase4BPipeline:
             if result.success:
                 candidate.paper_entered = True
                 candidate.paper_entry_time = time.time()
+                # Store actual execution data for persistence
+                candidate.actual_entry_price = result.fill_price_sol
+                candidate.actual_tokens_received = result.tokens_received
+                candidate.actual_sol_spent = result.sol_spent
+                candidate.actual_priority_fee = result.priority_fee_sol
+                candidate.actual_route_fees = result.route_fees_sol
+                candidate.actual_total_cost_basis = result.total_cost_basis_sol
+                candidate.actual_slippage = result.slippage_bps
+                candidate.actual_route_provider = result.route_provider
+                candidate.quote_timestamp = result.quote_timestamp
                 self.stats.paper_entries += 1
-                logger.info(f"Paper entry: {candidate.symbol} ({candidate.mint[:8]}...)")
+                logger.info(f"Paper entry: {candidate.symbol} ({candidate.mint[:8]}...) @ {result.fill_price_sol:.8f} SOL/token")
 
-                # Persist entry
-                await self._persist_paper_entry(candidate, intent, True)
+                # Persist entry with actual execution values
+                await self._persist_paper_entry(candidate, intent, True, result)
             else:
                 self.stats.provider_failures += 1
                 logger.warning(f"Entry failed for {candidate.mint}: {result.error}")
-                await self._persist_paper_entry(candidate, intent, False)
+                await self._persist_paper_entry(candidate, intent, False, result)
 
     async def _update_paper_positions(self) -> None:
         """Update all open paper positions with market data."""
@@ -866,11 +885,24 @@ class Phase4BPipeline:
             self.stats.database_errors += 1
             logger.error(f"Failed to persist meta decision: {e}")
 
-    async def _persist_paper_entry(self, candidate: Candidate, intent: EntryIntent, success: bool) -> None:
-        """Persist paper entry attempt."""
+    async def _persist_paper_entry(self, candidate: Candidate, intent: EntryIntent, success: bool, result: Optional[FillResult] = None) -> None:
+        """Persist paper entry attempt with actual execution values."""
         try:
             import sqlite3
             conn = sqlite3.connect(str(self.db_path))
+            
+            # Use actual execution data if available, otherwise fall back to intent
+            if result and result.success:
+                entry_price = result.avg_price
+                initial_tokens = float(result.tokens_filled)
+                entry_cost_basis = float(result.gross_proceeds) if result.gross_proceeds else intent.size_sol
+                entry_fees = float(result.network_costs) if result.network_costs else 0
+            else:
+                entry_price = 0.0
+                initial_tokens = 0.0
+                entry_cost_basis = 0.0
+                entry_fees = 0.0
+            
             conn.execute("""
                 INSERT INTO paper_positions
                 (mint, symbol, candidate_id, entry_price, entry_time, size_sol,
@@ -878,8 +910,9 @@ class Phase4BPipeline:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 candidate.mint, candidate.symbol, None,
-                intent.entry_price_hint, time.time(), intent.size_sol,
-                0, 0, 0, 0, "OPEN" if success else "REJECTED"
+                entry_price, time.time(), intent.size_sol,
+                initial_tokens, initial_tokens, entry_cost_basis, entry_fees,
+                "OPEN" if success else "REJECTED"
             ))
             conn.commit()
             conn.close()

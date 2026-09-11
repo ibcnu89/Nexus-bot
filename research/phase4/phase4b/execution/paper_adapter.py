@@ -73,6 +73,16 @@ class FillResult:
     realized_pnl: Decimal
     settlement: Optional["ExitSettlement"] = None
     error: Optional[str] = None
+    # Additional fields for persistence
+    fill_price_sol: float = 0.0
+    tokens_received: Decimal = Decimal(0)
+    sol_spent: float = 0.0
+    priority_fee_sol: float = 0.0
+    route_fees_sol: float = 0.0
+    total_cost_basis_sol: float = 0.0
+    slippage_bps: int = 0
+    route_provider: str = ""
+    quote_timestamp: float = 0.0
 
 
 class PaperExecutionAdapter:
@@ -286,11 +296,21 @@ class PaperExecutionAdapter:
                 mint=intent.mint,
                 side="buy",
                 tokens_filled=tokens_received,
-                avg_price=quote.quoted_execution_price,
-                gross_proceeds=Decimal(str(tokens_received)) * Decimal(str(quote.quoted_execution_price)),
+                avg_price=quote.executable_price,
+                gross_proceeds=Decimal(str(tokens_received)) * Decimal(str(quote.executable_price)),
                 network_costs=Decimal(str(priority_fee)),
                 net_proceeds=Decimal(0),  # No proceeds on entry
                 realized_pnl=Decimal(0),
+                # Additional fields for persistence
+                fill_price_sol=quote.executable_price,
+                tokens_received=tokens_received,
+                sol_spent=intent.size_sol + priority_fee,
+                priority_fee_sol=priority_fee,
+                route_fees_sol=0.0,  # Embedded in quote.out_amount
+                total_cost_basis_sol=net_cost_sol,
+                slippage_bps=round(quote.price_impact_pct * 10000) if quote.price_impact_pct else 0,
+                route_provider=quote.route or "unknown",
+                quote_timestamp=time.time(),
             )
             
         except TokenDecimalsError as e:

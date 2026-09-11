@@ -505,11 +505,22 @@ class HeliusClient:
         if not largest_accounts:
             return {}
         
-        total_supply = sum(acc.get("amount", 0) for acc in largest_accounts)
+        # Handle amount field which might be string from RPC
+        total_supply = 0
+        amounts = []
+        for acc in largest_accounts:
+            amount = acc.get("amount", 0)
+            if isinstance(amount, str):
+                try:
+                    amount = int(amount)
+                except ValueError:
+                    amount = 0
+            amounts.append(amount)
+            total_supply += amount
+            
         if total_supply == 0:
             return {}
         
-        amounts = [acc.get("amount", 0) for acc in largest_accounts]
         amounts.sort(reverse=True)
         
         top_1 = amounts[0] / total_supply if amounts else 0

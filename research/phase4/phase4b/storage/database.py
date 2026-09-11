@@ -242,6 +242,40 @@ CREATE TABLE IF NOT EXISTS market_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_market_mint_time ON market_snapshots(mint, snapshot_time);
 
+-- Outcome snapshots (for leakage-free outcome labeling)
+CREATE TABLE IF NOT EXISTS outcome_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    candidate_mint TEXT NOT NULL,
+    horizon_seconds INTEGER NOT NULL,
+    observation_time REAL NOT NULL,
+    price_sol REAL,
+    executable_buy_price REAL,
+    executable_sell_price REAL,
+    liquidity_usd REAL,
+    price_change_from_decision REAL,
+    max_favorable_excursion REAL,
+    max_adverse_excursion REAL,
+    peak_price REAL,
+    peak_return_pct REAL,
+    trough_price REAL,
+    trough_return_pct REAL,
+    time_to_peak REAL,
+    time_to_trough REAL,
+    liquidity_change_pct REAL,
+    tradable INTEGER DEFAULT 0,
+    sellable INTEGER DEFAULT 0,
+    rug_detected INTEGER DEFAULT 0,
+    liquidity_disappeared INTEGER DEFAULT 0,
+    freeze_authority_activated INTEGER DEFAULT 0,
+    missing_data_reason TEXT,
+    created_at REAL DEFAULT (strftime('%s', 'now')),
+    FOREIGN KEY (candidate_mint) REFERENCES candidates(mint)
+);
+
+CREATE INDEX IF NOT EXISTS idx_outcomes_mint ON outcome_snapshots(candidate_mint);
+CREATE INDEX IF NOT EXISTS idx_outcomes_horizon ON outcome_snapshots(horizon_seconds);
+CREATE INDEX IF NOT EXISTS idx_outcomes_obs_time ON outcome_snapshots(observation_time);
+
 -- Provider usage
 CREATE TABLE IF NOT EXISTS provider_usage (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
