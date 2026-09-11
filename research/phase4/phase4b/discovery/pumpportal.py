@@ -73,7 +73,7 @@ class PumpPortalDiscovery:
     
     @property
     def is_connected(self) -> bool:
-        return self._ws is not None and not self._ws.closed
+        return self._ws is not None and self._ws.state == websockets.protocol.State.OPEN
     
     @property
     def stats(self) -> dict:
@@ -118,7 +118,7 @@ class PumpPortalDiscovery:
     async def shutdown(self) -> None:
         """Stop the discovery loop."""
         self._running = False
-        if self._ws and not self._ws.closed:
+        if self._ws and self._ws.state == websockets.protocol.State.OPEN:
             await self._ws.close()
     
     async def _connect_and_listen(self) -> None:
@@ -277,7 +277,7 @@ class SolanaPublicRPCDiscovery:
     
     @property
     def is_connected(self) -> bool:
-        return self._ws is not None and not self._ws.closed
+        return self._ws is not None and self._ws.state == websockets.protocol.State.OPEN
     
     async def start(self) -> None:
         """Start the discovery loop."""
@@ -299,7 +299,7 @@ class SolanaPublicRPCDiscovery:
     async def shutdown(self) -> None:
         """Stop the discovery loop."""
         self._running = False
-        if self._ws and not self._ws.closed:
+        if self._ws and self._ws.state == websockets.protocol.State.OPEN:
             await self._ws.close()
     
     async def _connect_and_listen(self) -> None:
