@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Optional, Dict
+import os
 import aiohttp
 import logging
 
@@ -29,7 +30,6 @@ logger = logging.getLogger(__name__)
 # Current Jupiter API endpoints (verified 2025-09-10)
 JUPITER_QUOTE_API = "https://api.jup.ag/swap/v1/quote"
 JUPITER_PRICE_API = "https://api.jup.ag/price/v3"
-JUPITER_TOKENS_API = "https://tokens.jup.ag/all"  # V2/legacy but still works
 
 # PumpPortal API
 PUMPPORTAL_PRICE_API = "https://pumpportal.fun/api/price"
@@ -139,7 +139,7 @@ class PriceSource:
     - BUY (SOL -> token): input amount in SOL atomic units (lamports), output in token atomic units
     - SELL (token -> SOL): input amount in token atomic units, output in SOL atomic units (lamports)
     - All prices normalized to SOL per human-readable token
-    - Token decimals fetched from Jupiter token list and cached
+    - Token decimals supplied by authoritative on-chain mint data and cached
     - Failure to resolve decimals fails closed for executable sizing
     """
 
@@ -154,6 +154,7 @@ class PriceSource:
         self.pumpportal_api_url = pumpportal_api_url
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.max_retries = max_retries
+        self.jupiter_api_key = os.environ.get("JUPITER_API_KEY")
         self._session: Optional[aiohttp.ClientSession] = None
         self._token_decimals_cache: Dict[str, int] = {}
         self._token_info_cache: Dict[str, TokenInfo] = {}
@@ -161,7 +162,6 @@ class PriceSource:
 
     async def __aenter__(self):
         self._session = aiohttp.ClientSession(timeout=self.timeout)
-        await self._load_token_list()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -173,27 +173,12 @@ class PriceSource:
             self._session = aiohttp.ClientSession(timeout=self.timeout)
         return self._session
 
-    async def _load_token_list(self) -> None:
-        """Load token list from Jupiter for decimal information."""
-        try:
-            session = await self._get_session()
-            async with session.get(JUPITER_TOKENS_API) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    for token in data:
-                        mint = token.get("address")
-                        if mint:
-                            self._token_info_cache[mint] = TokenInfo(
-                                mint=mint,
-                                symbol=token.get("symbol", ""),
-                                name=token.get("name", ""),
-                                decimals=token.get("decimals", 9),
-                                logo_uri=token.get("logoURI"),
-                            )
-                            self._token_decimals_cache[mint] = token.get("decimals", 9)
-                    logger.info(f"Loaded {len(self._token_info_cache)} tokens from Jupiter")
-        except Exception as e:
-            logger.warning(f"Failed to load Jupiter token list: {e}")
+    def cache_token_decimals(self, mint: str, decimals: int) -> None:
+        """Cache authoritative on-chain mint decimals for executable sizing."""
+        if not isinstance(decimals, int) or isinstance(decimals, bool) or not 0 <= decimals <= 18:
+            raise TokenDecimalsError(f"Invalid token decimals for {mint}: {decimals!r}")
+        self._token_decimals_cache[mint] = decimals
+        self._decimals_resolved.add(mint)
 
     def get_token_decimals(self, mint: str) -> int:
         """Get token decimals. For SOL, returns 9. For unknown, raises for executable sizing."""
@@ -221,7 +206,12 @@ class PriceSource:
         session = await self._get_session()
         for attempt in range(self.max_retries):
             try:
-                async with session.get(url, params=params) as resp:
+                headers = (
+                    {"x-api-key": self.jupiter_api_key}
+                    if self.jupiter_api_key and url.startswith("https://api.jup.ag/")
+                    else {}
+                )
+                async with session.get(url, params=params, headers=headers) as resp:
                     if resp.status == 200:
                         return await resp.json()
                     elif resp.status == 429:

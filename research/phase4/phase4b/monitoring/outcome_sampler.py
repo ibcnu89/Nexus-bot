@@ -41,13 +41,12 @@ class OutcomeSnapshot:
     time_to_peak: Optional[float] = None
     time_to_trough: Optional[float] = None
     liquidity_change_pct: Optional[float] = None
-    tradable: bool = False
-    sellable: bool = False
-    rug_detected: bool = False
-    liquidity_disappeared: bool = False
-    freeze_authority_activated: bool = False
+    tradable: Optional[bool] = None
+    sellable: Optional[bool] = None
+    rug_detected: Optional[bool] = None
+    liquidity_disappeared: Optional[bool] = None
+    freeze_authority_activated: Optional[bool] = None
     missing_data_reason: Optional[str] = None
-    horizon_seconds: int = 0
 
 
 @dataclass
@@ -153,20 +152,18 @@ class OutcomePersister:
     async def persist_snapshot(self, snapshot: Any) -> None:
         """Persist a single outcome snapshot."""
         import sqlite3
-        import json
         conn = sqlite3.connect(self.db_path)
         try:
-            conn.execute("""
-                INSERT INTO outcome_snapshots
-                (candidate_mint, horizon_seconds, observation_time, price_sol,
-                 executable_buy_price, executable_sell_price, liquidity_usd,
-                 price_change_from_decision, max_favorable_excursion, max_adverse_excursion,
-                 peak_price, peak_return_pct, trough_price, trough_return_pct,
-                 time_to_peak, time_to_trough, liquidity_change_pct,
-                 tradable, sellable, rug_detected, liquidity_disappeared,
-                 freeze_authority_activated, missing_data_reason, horizon_seconds)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
+            columns = [
+                "candidate_mint", "horizon_seconds", "observation_time", "price_sol",
+                "executable_buy_price", "executable_sell_price", "liquidity_usd",
+                "price_change_from_decision", "max_favorable_excursion", "max_adverse_excursion",
+                "peak_price", "peak_return_pct", "trough_price", "trough_return_pct",
+                "time_to_peak", "time_to_trough", "liquidity_change_pct", "tradable",
+                "sellable", "rug_detected", "liquidity_disappeared",
+                "freeze_authority_activated", "missing_data_reason",
+            ]
+            values = (
                 snapshot.candidate_mint,
                 snapshot.horizon_seconds,
                 snapshot.observation_time,
@@ -184,14 +181,24 @@ class OutcomePersister:
                 snapshot.time_to_peak,
                 snapshot.time_to_trough,
                 snapshot.liquidity_change_pct,
-                int(snapshot.tradable),
-                int(snapshot.sellable),
-                int(snapshot.rug_detected),
-                int(snapshot.liquidity_disappeared),
-                int(snapshot.freeze_authority_activated),
+                None if snapshot.tradable is None else int(snapshot.tradable),
+                None if snapshot.sellable is None else int(snapshot.sellable),
+                None if snapshot.rug_detected is None else int(snapshot.rug_detected),
+                None if snapshot.liquidity_disappeared is None else int(snapshot.liquidity_disappeared),
+                None if snapshot.freeze_authority_activated is None else int(snapshot.freeze_authority_activated),
                 snapshot.missing_data_reason,
-                snapshot.horizon_seconds,
-            ))
+            )
+            assert len(columns) == len(values)
+            exists = conn.execute(
+                "SELECT 1 FROM outcome_snapshots WHERE candidate_mint = ? AND horizon_seconds = ? LIMIT 1",
+                (snapshot.candidate_mint, snapshot.horizon_seconds),
+            ).fetchone()
+            if not exists:
+                placeholders = ",".join("?" for _ in values)
+                conn.execute(
+                    f"INSERT INTO outcome_snapshots ({','.join(columns)}) VALUES ({placeholders})",
+                    values,
+                )
             conn.commit()
         except Exception as e:
             logger.error(f"Failed to persist outcome snapshot: {e}")

@@ -476,6 +476,14 @@ class HeliusClient:
             self._price_source = PriceSource()
             await self._price_source.__aenter__()
         return await self._price_source.get_sell_quote(mint, token_amount_human, slippage_bps)
+
+    async def _ensure_price_source_decimals(self, mint: str, decimals: int) -> None:
+        """Pass authoritative on-chain decimals into the quote boundary."""
+        if not hasattr(self, '_price_source'):
+            from research.phase4.prototype.price_source import PriceSource
+            self._price_source = PriceSource()
+            await self._price_source.__aenter__()
+        self._price_source.cache_token_decimals(mint, decimals)
     
     async def get_price(
         self,
@@ -511,6 +519,7 @@ class HeliusClient:
                 return None
             enrichment["token_info"] = token_info  # Keep nested structure
             credits_used += 1
+            await self._ensure_price_source_decimals(mint, token_info["decimals"])
             
             # 2. Largest accounts (SEMISTATIC) - 1 call
             largest = await self.get_token_largest_accounts(mint, limit=20)

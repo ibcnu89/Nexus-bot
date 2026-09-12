@@ -115,16 +115,19 @@ class Candidate:
     risk_score: float = 0.0
     risk_class: str = "unknown"
     risk_reasons: List[str] = field(default_factory=list)
+    risk_evaluated: bool = False
     
     # Narrative
     narrative_score: float = 0.0
     narrative_category: str = "unknown"
     narrative_confidence: float = 0.0
+    narrative_evaluated: bool = False
     
     # Meta scoring
     meta_score: float = 0.0
     meta_confidence: float = 0.0
     meta_approved: bool = False
+    meta_evaluated: bool = False
     rejection_reason: str = ""
     meta_component_breakdown: Dict = field(default_factory=dict)
     recommended_size_sol: float = 0.02

@@ -8,6 +8,7 @@ to ~1K for Helius enrichment.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections import defaultdict
 from typing import Dict, List, Optional, Set
@@ -256,6 +257,18 @@ class PreScorer:
         self._update_state(event)
         
         return candidate
+
+    def select_for_enrichment(self, candidates: List[Candidate]) -> Set[str]:
+        """Select the highest-scoring configured fraction, subject to hard limits."""
+        eligible = [c for c in candidates if c.pre_score >= self.min_score_threshold]
+        if not eligible:
+            return set()
+        target_count = min(
+            self.max_candidates_per_day,
+            max(1, math.ceil(len(candidates) * self.target_enrichment_pct)),
+        )
+        ranked = sorted(eligible, key=lambda c: (-c.pre_score, c.first_discovered, c.mint))
+        return {candidate.mint for candidate in ranked[:target_count]}
     
     def _explain_score(self, components: Dict[str, float]) -> str:
         """Generate human-readable explanation of score."""
