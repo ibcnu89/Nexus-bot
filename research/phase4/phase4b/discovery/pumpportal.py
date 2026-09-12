@@ -118,8 +118,14 @@ class PumpPortalDiscovery:
     async def shutdown(self) -> None:
         """Stop the discovery loop."""
         self._running = False
-        if self._ws and self._ws.state == websockets.protocol.State.OPEN:
-            await self._ws.close()
+        if self._ws:
+            # Check if websocket is closed (works for both ClientWebSocketResponse and ClientConnection)
+            ws_closed = getattr(self._ws, 'closed', False)
+            if not ws_closed:
+                try:
+                    await self._ws.close()
+                except Exception:
+                    pass
     
     async def _connect_and_listen(self) -> None:
         """Connect to WebSocket and listen for messages."""
@@ -299,8 +305,14 @@ class SolanaPublicRPCDiscovery:
     async def shutdown(self) -> None:
         """Stop the discovery loop."""
         self._running = False
-        if self._ws and self._ws.state == websockets.protocol.State.OPEN:
-            await self._ws.close()
+        if self._ws:
+            # Check if websocket is closed (works for both ClientWebSocketResponse and ClientConnection)
+            ws_closed = getattr(self._ws, 'closed', False)
+            if not ws_closed:
+                try:
+                    await self._ws.close()
+                except Exception:
+                    pass
     
     async def _connect_and_listen(self) -> None:
         logger.info(f"Connecting to Solana public RPC: {self.rpc_url}")
