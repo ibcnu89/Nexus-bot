@@ -448,6 +448,49 @@ class HeliusClient:
         
         return all_results
     
+    # --- Price Quote Methods (delegate to PriceSource pattern) ---
+    
+    async def get_buy_quote(
+        self,
+        mint: str,
+        sol_amount: float,
+        slippage_bps: int = 50,
+    ):
+        """Get quote for BUY: SOL -> token."""
+        # Delegate to a PriceSource instance - we'll create one internally
+        if not hasattr(self, '_price_source'):
+            from research.phase4.prototype.price_source import PriceSource
+            self._price_source = PriceSource()
+            await self._price_source.__aenter__()
+        return await self._price_source.get_buy_quote(mint, sol_amount, slippage_bps)
+    
+    async def get_sell_quote(
+        self,
+        mint: str,
+        token_amount_human: float,
+        slippage_bps: int = 50,
+    ):
+        """Get quote for SELL: token -> SOL."""
+        if not hasattr(self, '_price_source'):
+            from research.phase4.prototype.price_source import PriceSource
+            self._price_source = PriceSource()
+            await self._price_source.__aenter__()
+        return await self._price_source.get_sell_quote(mint, token_amount_human, slippage_bps)
+    
+    async def get_price(
+        self,
+        mint: str,
+        side: str = "sell",
+        size_sol: float = 0.1,
+        is_graduated: bool = False,
+    ):
+        """Get executable price for a token - delegates to PriceSource."""
+        if not hasattr(self, '_price_source'):
+            from research.phase4.prototype.price_source import PriceSource
+            self._price_source = PriceSource()
+            await self._price_source.__aenter__()
+        return await self._price_source.get_price(mint, side, size_sol, is_graduated)
+    
     # --- Enrichment Pipeline ---
     
     async def enrich_candidate(self, candidate) -> Optional[Dict]:
@@ -466,7 +509,7 @@ class HeliusClient:
             if not token_info:
                 logger.warning(f"Token info not found for {mint}")
                 return None
-            enrichment.update(token_info)
+            enrichment["token_info"] = token_info  # Keep nested structure
             credits_used += 1
             
             # 2. Largest accounts (SEMISTATIC) - 1 call
@@ -491,6 +534,30 @@ class HeliusClient:
             if "largest_accounts" in enrichment:
                 enrichment["holder_analysis"] = self._analyze_holders(enrichment["largest_accounts"])
             
+            # 5. Add sell quote for risk assessment
+            # Use a small test quantity (1000 tokens) for sellability check
+            try:
+                decimals = token_info.get("decimals", 9)
+                test_amount_human = 1000.0  # Small test quantity
+                sell_quote = await self.get_sell_quote(mint, test_amount_human, slippage_bps=50)
+                if sell_quote:
+                    enrichment["sell_quote"] = {
+                        "executable_price": sell_quote.executable_price,
+                        "price_impact_pct": sell_quote.price_impact_pct,
+                        "out_amount": sell_quote.out_amount,
+                        "in_amount": sell_quote.in_amount,
+                        "other_amount_threshold": sell_quote.other_amount_threshold,
+                        "route": sell_quote.route,
+                        "swap_fee_bps": sell_quote.swap_fee_bps,
+                        "platform_fee_bps": sell_quote.platform_fee_bps,
+                        "test_amount_human": test_amount_human,
+                        "test_amount_atomic": int(test_amount_human * (10 ** decimals)),
+                        "timestamp": time.time(),
+                    }
+            except Exception as e:
+                logger.warning(f"Failed to get sell quote for {mint}: {e}")
+            
+            # 6. Add get_price method delegate for market data fetching
             enrichment["enrichment_credits"] = credits_used
             enrichment["enriched_at"] = time.time()
             

@@ -109,6 +109,7 @@ class Candidate:
     enrichment_status: str = "pending"  # pending, in_progress, completed, failed
     enrichment_attempts: int = 0
     last_enrichment: float = 0.0
+    enrichment_data: Optional[Dict] = None
     
     # Risk
     risk_score: float = 0.0
@@ -125,6 +126,8 @@ class Candidate:
     meta_confidence: float = 0.0
     meta_approved: bool = False
     rejection_reason: str = ""
+    meta_component_breakdown: Dict = field(default_factory=dict)
+    recommended_size_sol: float = 0.02
     
     # Paper trading
     paper_entered: bool = False

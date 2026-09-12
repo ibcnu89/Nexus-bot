@@ -422,20 +422,26 @@ class SolanaPublicRPCDiscovery:
     
     async def shutdown(self) -> None:
         self._running = False
-        if self._ws and not self._ws.closed:
-            # Unsubscribe
-            if self._subscription_id is not None:
+        if self._ws:
+            # Check if websocket is closed (works for both ClientWebSocketResponse and ClientConnection)
+            ws_closed = getattr(self._ws, 'closed', False)
+            if not ws_closed:
+                # Unsubscribe
+                if self._subscription_id is not None:
+                    try:
+                        unsub_msg = {
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "method": "logsUnsubscribe",
+                            "params": [self._subscription_id]
+                        }
+                        await self._ws.send(json.dumps(unsub_msg))
+                    except Exception:
+                        pass
                 try:
-                    unsub_msg = {
-                        "jsonrpc": "2.0",
-                        "id": 2,
-                        "method": "logsUnsubscribe",
-                        "params": [self._subscription_id]
-                    }
-                    await self._ws.send(json.dumps(unsub_msg))
+                    await self._ws.close()
                 except Exception:
                     pass
-            await self._ws.close()
 
 
 class DiscoveryManager:

@@ -84,7 +84,7 @@ class PipelineConfig:
 @dataclass
 class PipelineStats:
     """Runtime statistics for the pipeline."""
-    start_time: float = field(default_factory=time.time)
+    start_time: float = 0.0
 
     # Discovery
     raw_events: int = 0
@@ -233,6 +233,10 @@ class Phase4BPipeline:
         """Initialize all pipeline components."""
         logger.info("Initializing Phase 4B pipeline...")
 
+        # Set start time for both pipeline and stats
+        self._start_time = time.time()
+        self.stats.start_time = time.time()
+
         # Ensure database directory exists
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -312,6 +316,10 @@ class Phase4BPipeline:
         from research.phase4.phase4b.scoring.meta_engine import MetaEngine
         self.meta_engine = MetaEngine()
 
+        # Narrative engine
+        from research.phase4.phase4b.narrative.narrative_engine import NarrativeEngine
+        self.narrative_engine = NarrativeEngine()
+
         # Discovery manager
         self.discovery_manager = DiscoveryManager(
             queue=self.discovery_queue,
@@ -324,8 +332,7 @@ class Phase4BPipeline:
     async def start(self) -> None:
         """Start the pipeline."""
         self._running = True
-        self._start_time = time.time()
-
+        
         # Start discovery
         self._tasks.append(asyncio.create_task(self.discovery_manager.start()))
 
@@ -367,6 +374,9 @@ class Phase4BPipeline:
 
     async def _processing_loop(self) -> None:
         """Main processing loop - handles candidate pipeline."""
+        # Use instance narrative engine
+        narrative_engine = self.narrative_engine
+        
         while self._running:
             try:
                 # Process discovery queue
@@ -381,8 +391,14 @@ class Phase4BPipeline:
                 # Process risk analysis
                 await self._process_risk_analysis()
 
+                # Process narrative analysis
+                await self._process_narrative_analysis(narrative_engine)
+
                 # Process meta decisions
                 await self._process_meta_decisions()
+
+                # Process paper entries
+                await self._process_paper_entries()
 
                 # Update paper positions
                 await self._update_paper_positions()
@@ -487,6 +503,8 @@ class Phase4BPipeline:
                     enrichment = enrichment_results[candidate.mint]
                     candidate.enrichment_status = "completed"
                     candidate.last_enrichment = time.time()
+                    # Attach enrichment data to candidate for downstream consumers
+                    candidate.enrichment_data = enrichment
                     # Store enrichment data
                     await self._persist_enrichment(candidate, enrichment)
                     self.stats.candidates_enriched += 1
@@ -534,6 +552,40 @@ class Phase4BPipeline:
             # Persist risk score
             await self._persist_risk_score(candidate)
 
+    async def _process_narrative_analysis(self, narrative_engine: NarrativeEngine) -> None:
+        """Analyze narrative for enriched candidates."""
+        if not self.discovery_queue or not narrative_engine:
+            return
+
+        enriched = [c for c in self.discovery_queue.get_all()
+                   if c.enrichment_status == "completed" and c.narrative_category == "unknown"]
+
+        for candidate in enriched:
+            enrichment_data = getattr(candidate, 'enrichment_data', {})
+            discovery_event = candidate.discovery_event
+            
+            narrative_signal = narrative_engine.analyze(
+                candidate_mint=candidate.mint,
+                discovery_data=discovery_event,
+                enrichment_data=enrichment_data,
+            )
+            
+            candidate.narrative_category = narrative_signal.get("category", "unknown")
+            candidate.narrative_score = narrative_signal.get("score", 0.0)
+            candidate.narrative_confidence = narrative_signal.get("confidence", 0.0)
+            candidate.narrative_reasons = narrative_signal.get("reasons", [])
+            candidate.narrative_sources_observed = narrative_signal.get("sources_observed", 0)
+            candidate.narrative_unique_sources = narrative_signal.get("unique_sources", 0)
+            candidate.narrative_mentions_total = narrative_signal.get("mentions_total", 0)
+            candidate.narrative_mentions_delta = narrative_signal.get("mentions_delta", 0.0)
+            candidate.narrative_unique_sources_delta = narrative_signal.get("unique_sources_delta", 0.0)
+            candidate.narrative_engagement_delta = narrative_signal.get("engagement_delta", 0.0)
+            candidate.narrative_missing_data = narrative_signal.get("missing_data", True)
+            candidate.narrative_unknown_state = narrative_signal.get("unknown_state", True)
+            
+            # Persist narrative
+            await self._persist_narrative(candidate, narrative_signal)
+
     async def _process_meta_decisions(self) -> None:
         """Make meta-scoring decisions for risk-passed candidates."""
         if not self.discovery_queue or not self.meta_engine:
@@ -547,19 +599,50 @@ class Phase4BPipeline:
                 and not c.meta_approved]
 
         for candidate in ready:
-            # Use real meta engine
-            # We need to derive inputs from candidate data
+            # Use real meta engine with actual data from candidate
             discovery_quality = candidate.pre_score * 100
             
-            onchain_quality = 50.0  # default
+            # On-Chain Quality - derived from enrichment
+            onchain_quality = 50.0
             if hasattr(candidate, 'enrichment_data') and candidate.enrichment_data:
-                onchain_quality = 75.0
+                enrichment = candidate.enrichment_data
+                # Check enrichment completeness
+                completeness = 0.0
+                if enrichment.get("token_info"):
+                    completeness += 0.3
+                if enrichment.get("largest_accounts"):
+                    completeness += 0.2
+                if enrichment.get("holder_analysis"):
+                    completeness += 0.2
+                if enrichment.get("creator_signatures"):
+                    completeness += 0.15
+                if enrichment.get("creator_accounts"):
+                    completeness += 0.15
+                onchain_quality = completeness * 100
             
-            liquidity_execution = 50.0  # placeholder - needs actual liquidity data
+            # Liquidity / Execution - from actual data
+            liquidity_execution = 50.0
+            if hasattr(candidate, 'enrichment_data') and candidate.enrichment_data:
+                enrichment = candidate.enrichment_data
+                if enrichment.get("holder_analysis"):
+                    ha = enrichment["holder_analysis"]
+                    top_10 = ha.get("top_10_holders_pct", 100)
+                    liquidity_execution = max(0, 100 - top_10)  # Less concentration = better liquidity
             
-            narrative_momentum = 50.0  # placeholder - needs narrative engine
+            # Narrative / Momentum - from narrative engine
+            narrative_momentum = 50.0  # default
+            narrative_confidence = 0.5
+            if hasattr(candidate, 'narrative_score') and candidate.narrative_score is not None:
+                narrative_momentum = candidate.narrative_score
+            if hasattr(candidate, 'narrative_confidence') and candidate.narrative_confidence is not None:
+                narrative_confidence = candidate.narrative_confidence
             
+            # Creator Quality - from enrichment
             creator_quality = candidate.pre_score * 100
+            if hasattr(candidate, 'enrichment_data') and candidate.enrichment_data:
+                enrichment = candidate.enrichment_data
+                if enrichment.get("creator_signatures") and enrichment.get("creator_accounts"):
+                    creator_quality = min(creator_quality * 1.2, 100)
             
             risk_score = int(candidate.risk_score)
             risk_class = candidate.risk_class
@@ -572,7 +655,7 @@ class Phase4BPipeline:
                 creator_quality=creator_quality,
                 risk_score=risk_score,
                 risk_class=risk_class,
-                narrative_confidence=0.5,
+                narrative_confidence=narrative_confidence,
                 enrichment_completeness=1.0 if candidate.enrichment_status == "completed" else 0.0,
                 quote_quality=0.5,
             )
@@ -710,8 +793,8 @@ class Phase4BPipeline:
                 await asyncio.sleep(30.0)
 
     async def _schedule_outcome_samples(self) -> None:
-        """Schedule outcome observations for candidates."""
-        if not self.discovery_queue:
+        """Schedule and collect outcome observations for candidates."""
+        if not self.discovery_queue or not self.helius_client:
             return
 
         all_candidates = self.discovery_queue.get_all()
@@ -724,9 +807,87 @@ class Phase4BPipeline:
             for horizon in horizons:
                 # Check if it's time to record this horizon
                 if candidate.first_discovered + horizon <= now:
-                    # Would record outcome here
-                    # For now, just track that we've scheduled it
-                    pass
+                    # Check if we've already recorded this horizon for this candidate
+                    # We'll track with a simple set on the candidate
+                    if not hasattr(candidate, '_outcomes_recorded'):
+                        candidate._outcomes_recorded = set()
+                    
+                    if horizon not in candidate._outcomes_recorded:
+                        # Record outcome snapshot
+                        await self._record_outcome_snapshot(candidate, horizon, now)
+                        candidate._outcomes_recorded.add(horizon)
+                        self.stats.outcomes_completed += 1
+
+    async def _record_outcome_snapshot(self, candidate: Candidate, horizon: int, now: float) -> None:
+        """Record an outcome snapshot for a candidate at a specific horizon."""
+        try:
+            # Get current price quote
+            quote = await self.helius_client.get_price(candidate.mint, side="sell", size_sol=0.02)
+            
+            price_sol = quote.executable_price if quote else None
+            executable_buy_price = None
+            executable_sell_price = price_sol
+            liquidity_usd = None
+            price_change_from_decision = None
+            
+            # Calculate price change from decision time if we have entry data
+            if hasattr(candidate, 'actual_entry_price') and candidate.actual_entry_price and price_sol:
+                price_change_from_decision = (price_sol - candidate.actual_entry_price) / candidate.actual_entry_price
+            
+            # Get sell quote status
+            sell_quote_available = False
+            try:
+                sell_quote = await self.helius_client.get_sell_quote(candidate.mint, 1000.0, slippage_bps=50)
+                if sell_quote:
+                    sell_quote_available = True
+            except:
+                pass
+            
+            # Persist to database
+            import sqlite3
+            conn = sqlite3.connect(str(self.db_path))
+            conn.execute("""
+                INSERT INTO outcome_snapshots
+                (candidate_mint, horizon_seconds, observation_time, price_sol,
+                 executable_buy_price, executable_sell_price, liquidity_usd,
+                 price_change_from_decision, max_favorable_excursion, max_adverse_excursion,
+                 peak_price, peak_return_pct, trough_price, trough_return_pct,
+                 time_to_peak, time_to_trough, liquidity_change_pct,
+                 tradable, sellable, rug_detected, liquidity_disappeared,
+                 freeze_authority_activated, missing_data_reason, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                candidate.mint,
+                horizon,
+                now,
+                price_sol,
+                executable_buy_price,
+                executable_sell_price,
+                liquidity_usd,
+                price_change_from_decision,
+                None,  # max_favorable_excursion
+                None,  # max_adverse_excursion
+                None,  # peak_price
+                None,  # peak_return_pct
+                None,  # trough_price
+                None,  # trough_return_pct
+                None,  # time_to_peak
+                None,  # time_to_trough
+                None,  # liquidity_change_pct
+                1 if price_sol else 0,  # tradable
+                1 if sell_quote_available else 0,  # sellable
+                0,  # rug_detected
+                0,  # liquidity_disappeared
+                0,  # freeze_authority_activated
+                None,  # missing_data_reason
+                now,  # created_at
+            ))
+            conn.commit()
+            conn.close()
+            
+        except Exception as e:
+            logger.error(f"Failed to record outcome snapshot for {candidate.mint} at {horizon}s: {e}")
+            self.stats.database_errors += 1
 
     async def _metrics_loop(self) -> None:
         """Periodic metrics logging."""
@@ -831,10 +992,79 @@ class Phase4BPipeline:
             self.stats.database_errors += 1
             logger.error(f"Failed to persist enrichment: {e}")
 
-    async def _persist_risk_score(self, candidate: Candidate) -> None:
-        """Persist risk score."""
+    async def _persist_narrative(self, candidate: Candidate, narrative_signal: Dict) -> None:
+        """Persist narrative analysis."""
         try:
             import sqlite3
+            conn = sqlite3.connect(str(self.db_path))
+            conn.execute("""
+                INSERT INTO narratives
+                (mint, candidate_id, snapshot_at, narrative_category, narrative_strength,
+                 narrative_velocity, social_presence_score, social_activity_score,
+                 duplicate_narrative_count, trend_alignment, pop_culture_relevance,
+                 metadata_quality, source_count, confidence, raw_sources)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                candidate.mint, None, time.time(),
+                narrative_signal.get("category", "unknown"),
+                narrative_signal.get("score", 0.0),
+                narrative_signal.get("mentions_delta", 0.0),
+                narrative_signal.get("sources_observed", 0),
+                narrative_signal.get("unique_sources", 0),
+                0,  # duplicate_narrative_count
+                None,  # trend_alignment
+                0.0,  # pop_culture_relevance
+                1.0 if not narrative_signal.get("missing_data", True) else 0.5,
+                narrative_signal.get("unique_sources", 0),
+                narrative_signal.get("confidence", 0.0),
+                json.dumps({
+                    "reasons": narrative_signal.get("reasons", []),
+                    "mentions_total": narrative_signal.get("mentions_total", 0),
+                    "engagement_delta": narrative_signal.get("engagement_delta", 0.0),
+                    "missing_data": narrative_signal.get("missing_data", True),
+                    "unknown_state": narrative_signal.get("unknown_state", True),
+                })
+            ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            self.stats.database_errors += 1
+            logger.error(f"Failed to persist narrative: {e}")
+
+    async def _persist_risk_score(self, candidate: Candidate) -> None:
+        """Persist risk score with actual values."""
+        try:
+            import sqlite3
+            conn = sqlite3.connect(str(self.db_path))
+            
+            # Extract actual values from risk assessment
+            mint_authority_active = 0
+            freeze_authority_active = 0
+            creator_holdings_pct = None
+            top_1_holder_pct = None
+            top_10_holders_pct = None
+            initial_liquidity_sol = None
+            current_liquidity_sol = None
+            liquidity_change_pct = None
+            creator_rapid_launches = None
+            metadata_abnormalities = "[]"
+            
+            if hasattr(candidate, 'risk_component_scores') and candidate.risk_component_scores:
+                # Extract from component scores
+                pass  # Component scores already in candidate.risk_reasons
+            
+            # Try to get from enrichment data
+            if hasattr(candidate, 'enrichment_data') and candidate.enrichment_data:
+                enrichment = candidate.enrichment_data
+                if enrichment.get("token_info"):
+                    token_info = enrichment["token_info"]
+                    mint_authority_active = 1 if token_info.get("mint_authority") else 0
+                    freeze_authority_active = 1 if token_info.get("freeze_authority") else 0
+                if enrichment.get("holder_analysis"):
+                    ha = enrichment["holder_analysis"]
+                    top_1_holder_pct = ha.get("top_1_holder_pct")
+                    top_10_holders_pct = ha.get("top_10_holders_pct")
+            
             conn = sqlite3.connect(str(self.db_path))
             conn.execute("""
                 INSERT INTO risk_scores
@@ -848,7 +1078,10 @@ class Phase4BPipeline:
                 candidate.mint, None,
                 candidate.risk_score, candidate.risk_class,
                 json.dumps(candidate.risk_reasons),
-                0, 0, 0, 0, 0, 0, 0, 0, 0, "[]"
+                mint_authority_active, freeze_authority_active,
+                creator_holdings_pct, top_1_holder_pct, top_10_holders_pct,
+                initial_liquidity_sol, current_liquidity_sol, liquidity_change_pct,
+                creator_rapid_launches, metadata_abnormalities
             ))
             conn.commit()
             conn.close()
@@ -857,10 +1090,20 @@ class Phase4BPipeline:
             logger.error(f"Failed to persist risk score: {e}")
 
     async def _persist_meta_decision(self, candidate: Candidate) -> None:
-        """Persist meta decision."""
+        """Persist meta decision with actual component scores."""
         try:
             import sqlite3
             conn = sqlite3.connect(str(self.db_path))
+            
+            # Use actual component breakdown from meta engine
+            component_breakdown = candidate.meta_component_breakdown if hasattr(candidate, 'meta_component_breakdown') else {}
+            discovery_score = component_breakdown.get("discovery_quality", candidate.pre_score * 20)
+            onchain_score = component_breakdown.get("onchain_quality", 20)
+            liquidity_score = component_breakdown.get("liquidity_execution", 10)
+            narrative_score = component_breakdown.get("narrative_momentum", 5)
+            creator_score = component_breakdown.get("creator_quality", 15)
+            risk_penalty = component_breakdown.get("risk_penalty", candidate.risk_score * 1.5)
+            
             conn.execute("""
                 INSERT INTO meta_decisions
                 (mint, candidate_id, decided_at, discovery_score, onchain_score,
@@ -868,16 +1111,19 @@ class Phase4BPipeline:
                  meta_score, confidence, expected_return_estimate, expected_downside,
                  estimated_execution_cost, estimated_slippage, risk_adjusted_ev,
                  recommended_size_sol, entry_reason, rejection_reason, decision,
-                 component_scores)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 component_scores, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 candidate.mint, None, time.time(),
-                candidate.pre_score * 20, 20, 10, 5, 15,
-                candidate.risk_score * 1.5,
-                candidate.meta_score, candidate.meta_confidence, 0, 0, 0, 0,
-                candidate.meta_score, 0.0, "", candidate.rejection_reason,
+                discovery_score, onchain_score,
+                liquidity_score, narrative_score, creator_score, risk_penalty,
+                candidate.meta_score, candidate.meta_confidence, 0, 0, 0, 0, 0,
+                candidate.recommended_size_sol if hasattr(candidate, 'recommended_size_sol') else 0.0,
                 "approve" if candidate.meta_approved else "reject",
-                json.dumps({"pre_score": candidate.pre_score, "risk": candidate.risk_score})
+                candidate.rejection_reason if hasattr(candidate, 'rejection_reason') else "",
+                "approve" if candidate.meta_approved else "reject",
+                json.dumps(candidate.meta_component_breakdown if hasattr(candidate, 'meta_component_breakdown') else {}),
+                time.time()
             ))
             conn.commit()
             conn.close()
