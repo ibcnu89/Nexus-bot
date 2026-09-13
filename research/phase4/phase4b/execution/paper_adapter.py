@@ -78,11 +78,14 @@ class FillResult:
     tokens_received: Decimal = Decimal(0)
     sol_spent: float = 0.0
     priority_fee_sol: float = 0.0
-    route_fees_sol: float = 0.0
+    route_fees_sol: Optional[float] = None
     total_cost_basis_sol: float = 0.0
     slippage_bps: int = 0
     route_provider: str = ""
     quote_timestamp: float = 0.0
+    price_impact_pct: float = 0.0
+    swap_fee_bps: int = 0
+    platform_fee_bps: int = 0
 
 
 class PaperExecutionAdapter:
@@ -238,11 +241,14 @@ class PaperExecutionAdapter:
             # Calculate tokens received
             tokens_received = quote.get_token_amount()
             
-            # Priority fee
+            # Priority fee and actual swap input
             priority_fee = min(intent.max_priority_fee_sol, 0.001)  # Cap at 0.001 SOL
-            
-            # Net cost = intent.size_sol + priority_fee
-            net_cost_sol = intent.size_sol + priority_fee
+            actual_sol_spent = float(quote.get_sol_amount())
+            net_cost_sol = actual_sol_spent + priority_fee
+            quote_slippage_bps = (
+                round((1.0 - quote.other_amount_threshold / quote.out_amount) * 10_000)
+                if quote.out_amount > 0 else 0
+            )
             
             # Create prototype PriceQuote for PaperPosition
             proto_quote = self.PrototypePriceQuote(
@@ -297,20 +303,23 @@ class PaperExecutionAdapter:
                 side="buy",
                 tokens_filled=tokens_received,
                 avg_price=quote.executable_price,
-                gross_proceeds=Decimal(str(tokens_received)) * Decimal(str(quote.executable_price)),
+                gross_proceeds=Decimal(str(actual_sol_spent)),
                 network_costs=Decimal(str(priority_fee)),
                 net_proceeds=Decimal(0),  # No proceeds on entry
                 realized_pnl=Decimal(0),
                 # Additional fields for persistence
                 fill_price_sol=quote.executable_price,
                 tokens_received=tokens_received,
-                sol_spent=intent.size_sol + priority_fee,
+                sol_spent=actual_sol_spent,
                 priority_fee_sol=priority_fee,
-                route_fees_sol=0.0,  # Embedded in quote.out_amount
+                route_fees_sol=quote.route_fee_sol,
                 total_cost_basis_sol=net_cost_sol,
-                slippage_bps=round(quote.price_impact_pct * 10000) if quote.price_impact_pct else 0,
+                slippage_bps=quote_slippage_bps,
                 route_provider=quote.route or "unknown",
-                quote_timestamp=time.time(),
+                quote_timestamp=quote.timestamp,
+                price_impact_pct=quote.price_impact_pct,
+                swap_fee_bps=quote.swap_fee_bps,
+                platform_fee_bps=quote.platform_fee_bps,
             )
             
         except TokenDecimalsError as e:
@@ -448,7 +457,7 @@ class PaperExecutionAdapter:
             # Also update prototype PaperPosition for exit logic
             # Create prototype quote for PaperPosition update
             proto_quote = self.PrototypePriceQuote(
-                price=quote.quoted_execution_price,
+                price=exec_quote.quoted_execution_price,
                 price_impact_pct=quote.price_impact_pct,
                 out_amount=0,
                 in_amount=0,
@@ -460,7 +469,7 @@ class PaperExecutionAdapter:
             
             # Update PaperPosition (triggers exit logic)
             triggers = position.update_market_data(
-                price=quote.quoted_execution_price,
+                price=exec_quote.quoted_execution_price,
                 liquidity_usd=0,  # Would come from enrichment
                 market_cap_usd=0,
                 volume_24h_usd=0,
@@ -481,7 +490,7 @@ class PaperExecutionAdapter:
             self.stats["total_realized_pnl_sol"] += float(settlement.realized_pnl_sol)
             
             logger.info(f"Paper exit: {position.symbol} ({intent.mint[:8]}...) "
-                       f"sold {intent.tokens_to_sell:.4f} tokens @ {quote.quoted_execution_price:.8f} SOL, "
+                       f"sold {intent.tokens_to_sell:.4f} tokens @ {exec_quote.quoted_execution_price:.8f} SOL, "
                        f"net {float(settlement.net_proceeds_sol):.6f} SOL, "
                        f"P&L {float(settlement.realized_pnl_sol):.6f} SOL")
             
@@ -490,12 +499,21 @@ class PaperExecutionAdapter:
                 mint=intent.mint,
                 side="sell",
                 tokens_filled=intent.tokens_to_sell,
-                avg_price=quote.quoted_execution_price,
+                avg_price=exec_quote.quoted_execution_price,
                 gross_proceeds=settlement.gross_proceeds_sol,
                 network_costs=Decimal(str(priority_fee)),
                 net_proceeds=settlement.net_proceeds_sol,
                 realized_pnl=settlement.realized_pnl_sol,
                 settlement=settlement,
+                fill_price_sol=exec_quote.quoted_execution_price,
+                priority_fee_sol=priority_fee,
+                route_fees_sol=quote.route_fee_sol,
+                slippage_bps=exec_quote.slippage_bps,
+                route_provider=quote.route or "unknown",
+                quote_timestamp=quote.timestamp,
+                price_impact_pct=quote.price_impact_pct,
+                swap_fee_bps=quote.swap_fee_bps,
+                platform_fee_bps=quote.platform_fee_bps,
             )
             
         except Exception as e:

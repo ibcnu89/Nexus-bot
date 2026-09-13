@@ -31,6 +31,10 @@ Thumbs.db
 research/phase3b/result_*.json
 research/phase3b/phase3b_complete_results.json
 
+# Phase 4B generated experiment state
+research/phase4/phase4b/results/*.db
+research/phase4/phase4b/results/soak_test_results_*.json
+
 # Logs
 logs/
 *.log

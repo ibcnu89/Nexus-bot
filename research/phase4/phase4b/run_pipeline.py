@@ -95,10 +95,12 @@ class PipelineStats:
     candidates_pre_scored: int = 0
     candidates_passed: int = 0
     candidates_failed: int = 0
+    enrichment_quota: int = 0
 
     # Enrichment
     candidates_enriched: int = 0
     enrichment_failures: int = 0
+    enrichment_attempts: int = 0
     helius_credits_used: int = 0
 
     # Risk
@@ -145,11 +147,13 @@ class PipelineStats:
                 "candidates_scored": self.candidates_pre_scored,
                 "passed": self.candidates_passed,
                 "failed": self.candidates_failed,
+                "enrichment_quota": self.enrichment_quota,
                 "pass_rate": round(self.candidates_passed / max(self.candidates_pre_scored, 1), 4),
             },
             "enrichment": {
                 "enriched": self.candidates_enriched,
                 "failures": self.enrichment_failures,
+                "attempts": self.enrichment_attempts,
                 "helius_credits_used": self.helius_credits_used,
             },
             "risk": {
@@ -426,8 +430,6 @@ class Phase4BPipeline:
             if candidate.pre_score_timestamp > 0:
                 continue
             
-            self.stats.candidates_pre_scored += 1
-            
             # Run pre-scorer on the discovery event
             if candidate.discovery_event:
                 event = DiscoveryEvent(
@@ -457,22 +459,29 @@ class Phase4BPipeline:
                 candidate.pre_score = scored_candidate.pre_score
                 candidate.pre_score_components = scored_candidate.pre_score_components
                 candidate.pre_score_reason = scored_candidate.pre_score_reason
-                candidate.pre_score_passed = scored_candidate.pre_score_passed
+                candidate.pre_score_passed = False
                 candidate.pre_score_timestamp = scored_candidate.pre_score_timestamp
                 newly_scored.append(candidate)
 
         selected_mints = self.pre_scorer.select_for_enrichment(
             [c for c in all_candidates if c.pre_score_timestamp > 0]
         )
+        changed_candidates = {candidate.mint: candidate for candidate in newly_scored}
         for candidate in all_candidates:
             if candidate.enrichment_status == "pending":
-                candidate.pre_score_passed = candidate.mint in selected_mints
+                selected = candidate.mint in selected_mints
+                if candidate.pre_score_passed != selected:
+                    candidate.pre_score_passed = selected
+                    changed_candidates[candidate.mint] = candidate
 
-        for candidate in newly_scored:
-            if candidate.pre_score_passed:
-                self.stats.candidates_passed += 1
-            else:
-                self.stats.candidates_failed += 1
+        scored_count = sum(1 for c in all_candidates if c.pre_score_timestamp > 0)
+        passed_count = sum(1 for c in all_candidates if c.pre_score_passed)
+        self.stats.candidates_pre_scored = scored_count
+        self.stats.candidates_passed = passed_count
+        self.stats.candidates_failed = scored_count - passed_count
+        self.stats.enrichment_quota = self.pre_scorer.enrichment_quota(all_candidates)
+
+        for candidate in changed_candidates.values():
             await self._persist_candidate(candidate)
 
     async def _process_pre_scoring(self) -> None:
@@ -518,8 +527,12 @@ class Phase4BPipeline:
                     self.stats.helius_credits_used += enrichment.get("enrichment_credits", 0)
                 else:
                     candidate.enrichment_status = "failed"
-                    candidate.enrichment_attempts += 1
                     self.stats.enrichment_failures += 1
+
+            self.stats.enrichment_attempts = sum(
+                1 for candidate in self.discovery_queue.get_all()
+                if candidate.enrichment_attempts > 0
+            )
 
         except Exception as e:
             self.stats.enrichment_failures += len(candidates_to_enrich)
@@ -1163,27 +1176,53 @@ class Phase4BPipeline:
             
             # Use actual execution data if available, otherwise fall back to intent
             if result and result.success:
-                entry_price = result.avg_price
-                initial_tokens = float(result.tokens_filled)
-                entry_cost_basis = float(result.gross_proceeds) if result.gross_proceeds else intent.size_sol
-                entry_fees = float(result.network_costs) if result.network_costs else 0
+                entry_price = result.fill_price_sol
+                initial_tokens = float(result.tokens_received)
+                entry_cost_basis = result.total_cost_basis_sol
+                entry_fees = result.priority_fee_sol
+                size_sol = result.sol_spent
+                entry_time = candidate.paper_entry_time or time.time()
             else:
                 entry_price = 0.0
                 initial_tokens = 0.0
                 entry_cost_basis = 0.0
                 entry_fees = 0.0
+                size_sol = intent.size_sol
+                entry_time = time.time()
             
-            conn.execute("""
+            cursor = conn.execute("""
                 INSERT INTO paper_positions
                 (mint, symbol, candidate_id, entry_price, entry_time, size_sol,
                  initial_tokens, tokens_remaining, entry_cost_basis_sol, entry_fees_sol, state)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 candidate.mint, candidate.symbol, None,
-                entry_price, time.time(), intent.size_sol,
+                entry_price, entry_time, size_sol,
                 initial_tokens, initial_tokens, entry_cost_basis, entry_fees,
                 "OPEN" if success else "REJECTED"
             ))
+            if result and result.success:
+                conn.execute("""
+                    INSERT INTO paper_fills
+                    (position_id, mint, side, fill_time, tokens_filled, avg_price,
+                     gross_proceeds_sol, network_costs_sol, net_proceeds_sol,
+                     realized_pnl_sol, quote_timestamp, quote_age_seconds,
+                     quote_price_impact_pct, quote_slippage_bps, quote_route,
+                     quote_swap_fee_bps, quote_platform_fee_bps, priority_fee_sol,
+                     tokens_remaining, realized_pnl_cumulative)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    cursor.lastrowid, candidate.mint, result.side, entry_time,
+                    float(result.tokens_filled), result.avg_price,
+                    float(result.gross_proceeds), float(result.network_costs),
+                    float(result.net_proceeds), float(result.realized_pnl),
+                    result.quote_timestamp,
+                    max(0.0, entry_time - result.quote_timestamp),
+                    result.price_impact_pct, result.slippage_bps,
+                    result.route_provider, result.swap_fee_bps,
+                    result.platform_fee_bps, result.priority_fee_sol,
+                    float(result.tokens_filled), float(result.realized_pnl),
+                ))
             conn.commit()
             conn.close()
         except Exception as e:

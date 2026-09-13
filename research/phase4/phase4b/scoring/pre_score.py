@@ -8,7 +8,6 @@ to ~1K for Helius enrichment.
 from __future__ import annotations
 
 import logging
-import math
 import time
 from collections import defaultdict
 from typing import Dict, List, Optional, Set
@@ -235,9 +234,6 @@ class PreScorer:
         components = self.score(event)
         total_score = self.compute_score(components)
         
-        # Determine if passes threshold
-        passed = total_score >= self.min_score_threshold
-        
         # Create candidate
         candidate = Candidate(
             mint=event.mint,
@@ -249,7 +245,8 @@ class PreScorer:
             pre_score=total_score,
             pre_score_components=components,
             pre_score_reason=self._explain_score(components),
-            pre_score_passed=passed,
+            # Admission is assigned by select_for_enrichment(), not by a zero threshold.
+            pre_score_passed=False,
             pre_score_timestamp=time.time(),
         )
         
@@ -258,17 +255,34 @@ class PreScorer:
         
         return candidate
 
-    def select_for_enrichment(self, candidates: List[Candidate]) -> Set[str]:
-        """Select the highest-scoring configured fraction, subject to hard limits."""
-        eligible = [c for c in candidates if c.pre_score >= self.min_score_threshold]
-        if not eligible:
-            return set()
-        target_count = min(
+    def enrichment_quota(self, candidates: List[Candidate]) -> int:
+        """Return the hard cumulative admission quota for the scored cohort."""
+        scored_count = sum(1 for candidate in candidates if candidate.pre_score_timestamp > 0)
+        return min(
             self.max_candidates_per_day,
-            max(1, math.ceil(len(candidates) * self.target_enrichment_pct)),
+            int(scored_count * self.target_enrichment_pct),
         )
-        ranked = sorted(eligible, key=lambda c: (-c.pre_score, c.first_discovered, c.mint))
-        return {candidate.mint for candidate in ranked[:target_count]}
+
+    def select_for_enrichment(self, candidates: List[Candidate]) -> Set[str]:
+        """Reserve only the remaining cumulative top-fraction enrichment slots."""
+        scored = [c for c in candidates if c.pre_score_timestamp > 0]
+        quota = self.enrichment_quota(scored)
+        if quota <= 0:
+            return set()
+
+        eligible = [c for c in scored if c.pre_score >= self.min_score_threshold]
+        admitted = {
+            c.mint for c in eligible
+            if c.pre_score_passed or c.enrichment_attempts > 0 or c.enrichment_status != "pending"
+        }
+        remaining_slots = max(0, quota - len(admitted))
+        if remaining_slots == 0:
+            return admitted
+
+        pending = [c for c in eligible if c.mint not in admitted]
+        ranked = sorted(pending, key=lambda c: (-c.pre_score, c.first_discovered, c.mint))
+        admitted.update(candidate.mint for candidate in ranked[:remaining_slots])
+        return admitted
     
     def _explain_score(self, components: Dict[str, float]) -> str:
         """Generate human-readable explanation of score."""

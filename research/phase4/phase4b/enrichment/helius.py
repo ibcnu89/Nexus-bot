@@ -7,13 +7,14 @@ Implements selective on-chain enrichment with aggressive caching and credit budg
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
 import os
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from decimal import Decimal
 from enum import Enum
 from functools import lru_cache
@@ -254,6 +255,8 @@ class HeliusClient:
         
         self._session: Optional[aiohttp.ClientSession] = None
         self._token_cache: Dict[str, Dict] = {}  # mint -> {decimals, supply, authorities}
+        self._bonding_curve_accounts: Dict[str, tuple[str, int]] = {}
+        self._last_bonding_curve_states: Dict[str, Any] = {}
         
         # RPC method credit costs
         self.credit_costs = {
@@ -275,6 +278,8 @@ class HeliusClient:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self._session:
             await self._session.close()
+        if hasattr(self, '_price_source'):
+            await self._price_source.__aexit__(exc_type, exc_val, exc_tb)
     
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -448,7 +453,120 @@ class HeliusClient:
         
         return all_results
     
-    # --- Price Quote Methods (delegate to PriceSource pattern) ---
+    # --- Price Quote Methods ---
+
+    async def _ensure_price_source(self):
+        if not hasattr(self, '_price_source'):
+            from research.phase4.prototype.price_source import PriceSource
+            self._price_source = PriceSource()
+        return self._price_source
+
+    @staticmethod
+    def parse_bonding_curve_account(
+        mint: str,
+        bonding_curve_key: str,
+        decimals: int,
+        account_value: Dict[str, Any],
+        observed_at: Optional[float] = None,
+    ):
+        """Parse the stable prefix of Pump.fun's Anchor bonding-curve account."""
+        from research.phase4.prototype.price_source import BondingCurveState
+
+        encoded = account_value.get("data") if account_value else None
+        if isinstance(encoded, (list, tuple)):
+            encoded = encoded[0] if encoded else None
+        if not isinstance(encoded, str):
+            raise ValueError("Bonding-curve account has no base64 data")
+
+        raw = base64.b64decode(encoded, validate=True)
+        if len(raw) < 49:
+            raise ValueError(f"Bonding-curve account is too short: {len(raw)} bytes")
+
+        def u64(offset: int) -> int:
+            return int.from_bytes(raw[offset:offset + 8], "little", signed=False)
+
+        return BondingCurveState(
+            mint=mint,
+            bonding_curve_key=bonding_curve_key,
+            token_decimals=decimals,
+            virtual_token_reserves=u64(8),
+            virtual_sol_reserves=u64(16),
+            real_token_reserves=u64(24),
+            real_sol_reserves=u64(32),
+            token_total_supply=u64(40),
+            complete=bool(raw[48]),
+            observed_at=observed_at or time.time(),
+            source="helius_getAccountInfo",
+        )
+
+    async def get_bonding_curve_state(
+        self,
+        mint: str,
+        bonding_curve_key: str,
+        decimals: int,
+    ):
+        """Read a fresh Pump.fun bonding-curve account and cache its reserve state."""
+        result = await self._rpc_call(
+            "getAccountInfo",
+            [bonding_curve_key, {"encoding": "base64", "commitment": "processed"}],
+        )
+        if not result or not result.get("value"):
+            return None
+        try:
+            state = self.parse_bonding_curve_account(
+                mint,
+                bonding_curve_key,
+                decimals,
+                result["value"],
+            )
+        except (TypeError, ValueError) as exc:
+            logger.warning(f"Invalid bonding-curve account for {mint}: {exc}")
+            return None
+
+        price_source = await self._ensure_price_source()
+        price_source.cache_bonding_curve_state(state)
+        self._last_bonding_curve_states[mint] = state
+        return state
+
+    def _register_discovery_curve_state(self, candidate, decimals: int) -> bool:
+        """Seed route state from the discovery event until a fresh RPC read succeeds."""
+        from research.phase4.prototype.price_source import BondingCurveState, LAMPORTS_PER_SOL
+
+        event = candidate.discovery_event or {}
+        if event.get("pool") != "pump" or not event.get("bonding_curve_key"):
+            return False
+
+        self._bonding_curve_accounts[candidate.mint] = (event["bonding_curve_key"], decimals)
+        token_reserves = event.get("v_tokens_in_bonding_curve")
+        sol_reserves = event.get("v_sol_in_bonding_curve")
+        if token_reserves is None or sol_reserves is None:
+            return True
+
+        try:
+            state = BondingCurveState(
+                mint=candidate.mint,
+                bonding_curve_key=event["bonding_curve_key"],
+                token_decimals=decimals,
+                virtual_token_reserves=int(Decimal(str(token_reserves)) * (10 ** decimals)),
+                virtual_sol_reserves=int(Decimal(str(sol_reserves)) * LAMPORTS_PER_SOL),
+                observed_at=float(event.get("receive_timestamp") or candidate.first_discovered),
+                source="pumpportal_discovery_event",
+            )
+        except (TypeError, ValueError) as exc:
+            logger.warning(f"Invalid discovery curve reserves for {candidate.mint}: {exc}")
+            return True
+
+        self._last_bonding_curve_states[candidate.mint] = state
+        if hasattr(self, '_price_source'):
+            self._price_source.cache_bonding_curve_state(state)
+        return True
+
+    async def _refresh_registered_curve(self, mint: str):
+        registration = self._bonding_curve_accounts.get(mint)
+        if not registration:
+            return None
+        bonding_curve_key, decimals = registration
+        return await self.get_bonding_curve_state(mint, bonding_curve_key, decimals)
     
     async def get_buy_quote(
         self,
@@ -456,13 +574,10 @@ class HeliusClient:
         sol_amount: float,
         slippage_bps: int = 50,
     ):
-        """Get quote for BUY: SOL -> token."""
-        # Delegate to a PriceSource instance - we'll create one internally
-        if not hasattr(self, '_price_source'):
-            from research.phase4.prototype.price_source import PriceSource
-            self._price_source = PriceSource()
-            await self._price_source.__aenter__()
-        return await self._price_source.get_buy_quote(mint, sol_amount, slippage_bps)
+        """Get a venue-aware quote for BUY: SOL -> token."""
+        price_source = await self._ensure_price_source()
+        await self._refresh_registered_curve(mint)
+        return await price_source.get_buy_quote(mint, sol_amount, slippage_bps)
     
     async def get_sell_quote(
         self,
@@ -470,20 +585,15 @@ class HeliusClient:
         token_amount_human: float,
         slippage_bps: int = 50,
     ):
-        """Get quote for SELL: token -> SOL."""
-        if not hasattr(self, '_price_source'):
-            from research.phase4.prototype.price_source import PriceSource
-            self._price_source = PriceSource()
-            await self._price_source.__aenter__()
-        return await self._price_source.get_sell_quote(mint, token_amount_human, slippage_bps)
+        """Get a venue-aware quote for SELL: token -> SOL."""
+        price_source = await self._ensure_price_source()
+        await self._refresh_registered_curve(mint)
+        return await price_source.get_sell_quote(mint, token_amount_human, slippage_bps)
 
     async def _ensure_price_source_decimals(self, mint: str, decimals: int) -> None:
         """Pass authoritative on-chain decimals into the quote boundary."""
-        if not hasattr(self, '_price_source'):
-            from research.phase4.prototype.price_source import PriceSource
-            self._price_source = PriceSource()
-            await self._price_source.__aenter__()
-        self._price_source.cache_token_decimals(mint, decimals)
+        price_source = await self._ensure_price_source()
+        price_source.cache_token_decimals(mint, decimals)
     
     async def get_price(
         self,
@@ -492,12 +602,11 @@ class HeliusClient:
         size_sol: float = 0.1,
         is_graduated: bool = False,
     ):
-        """Get executable price for a token - delegates to PriceSource."""
-        if not hasattr(self, '_price_source'):
-            from research.phase4.prototype.price_source import PriceSource
-            self._price_source = PriceSource()
-            await self._price_source.__aenter__()
-        return await self._price_source.get_price(mint, side, size_sol, is_graduated)
+        """Get a venue-aware executable paper price."""
+        price_source = await self._ensure_price_source()
+        state = await self._refresh_registered_curve(mint)
+        graduated = is_graduated or bool(state and state.complete)
+        return await price_source.get_price(mint, side, size_sol, graduated)
     
     # --- Enrichment Pipeline ---
     
@@ -509,7 +618,7 @@ class HeliusClient:
         """
         mint = candidate.mint
         enrichment = {}
-        credits_used = 0
+        credits_before = self.governor.get_state()["credits_used"]
         
         try:
             # 1. Token info (IMMUTABLE) - 1 call
@@ -518,13 +627,18 @@ class HeliusClient:
                 logger.warning(f"Token info not found for {mint}")
                 return None
             enrichment["token_info"] = token_info  # Keep nested structure
-            credits_used += 1
             await self._ensure_price_source_decimals(mint, token_info["decimals"])
+
+            event_pool = (candidate.discovery_event or {}).get("pool")
+            is_bonding_curve = event_pool == "pump"
+            curve_registered = self._register_discovery_curve_state(
+                candidate,
+                token_info["decimals"],
+            )
             
             # 2. Largest accounts (SEMISTATIC) - 1 call
             largest = await self.get_token_largest_accounts(mint, limit=20)
             enrichment["largest_accounts"] = largest
-            credits_used += 1
             
             # 3. Creator analysis - get creator from candidate
             creator = candidate.enrichment_creator if hasattr(candidate, 'enrichment_creator') else None
@@ -532,12 +646,10 @@ class HeliusClient:
                 # 3a. Creator signatures - 1 call
                 sigs = await self.get_signatures_for_address(creator, limit=50)
                 enrichment["creator_signatures"] = sigs
-                credits_used += 1
                 
                 # 3b. Creator token accounts - 1 call
                 creator_accounts = await self.get_token_accounts_by_owner(creator)
                 enrichment["creator_accounts"] = creator_accounts
-                credits_used += 1
             
             # 4. Holder distribution from largest accounts
             if "largest_accounts" in enrichment:
@@ -548,7 +660,10 @@ class HeliusClient:
             try:
                 decimals = token_info.get("decimals", 9)
                 test_amount_human = 1000.0  # Small test quantity
-                sell_quote = await self.get_sell_quote(mint, test_amount_human, slippage_bps=50)
+                if is_bonding_curve and not curve_registered:
+                    sell_quote = None
+                else:
+                    sell_quote = await self.get_sell_quote(mint, test_amount_human, slippage_bps=50)
                 if sell_quote:
                     enrichment["sell_quote"] = {
                         "executable_price": sell_quote.executable_price,
@@ -559,15 +674,22 @@ class HeliusClient:
                         "route": sell_quote.route,
                         "swap_fee_bps": sell_quote.swap_fee_bps,
                         "platform_fee_bps": sell_quote.platform_fee_bps,
+                        "venue_state_source": sell_quote.venue_state_source,
+                        "venue_state_observed_at": sell_quote.venue_state_observed_at,
                         "test_amount_human": test_amount_human,
                         "test_amount_atomic": int(test_amount_human * (10 ** decimals)),
                         "timestamp": time.time(),
                     }
+                state = self._last_bonding_curve_states.get(mint)
+                if state:
+                    enrichment["bonding_curve_state"] = asdict(state)
             except Exception as e:
                 logger.warning(f"Failed to get sell quote for {mint}: {e}")
             
             # 6. Add get_price method delegate for market data fetching
-            enrichment["enrichment_credits"] = credits_used
+            enrichment["enrichment_credits"] = (
+                self.governor.get_state()["credits_used"] - credits_before
+            )
             enrichment["enriched_at"] = time.time()
             
             return enrichment
