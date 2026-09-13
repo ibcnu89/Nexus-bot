@@ -653,7 +653,12 @@ class HeliusClient:
             
             # 4. Holder distribution from largest accounts
             if "largest_accounts" in enrichment:
-                enrichment["holder_analysis"] = self._analyze_holders(enrichment["largest_accounts"])
+                bonding_curve_key = candidate.discovery_event.get("bonding_curve_key") if candidate.discovery_event else None
+                enrichment["holder_analysis"] = await self._analyze_holders(
+                    enrichment["largest_accounts"],
+                    token_info,
+                    bonding_curve_key,
+                )
             
             # 5. Add sell quote for risk assessment
             # Use a small test quantity (1000 tokens) for sellability check
@@ -698,14 +703,31 @@ class HeliusClient:
             logger.error(f"Enrichment failed for {mint}: {e}")
             return None
     
-    def _analyze_holders(self, largest_accounts: List[Dict]) -> Dict:
-        """Analyze holder concentration from largest accounts."""
+    async def _analyze_holders(
+        self,
+        largest_accounts: List[Dict],
+        token_info: Optional[Dict],
+        bonding_curve_key: Optional[str] = None,
+    ) -> Dict:
+        """Analyze holder concentration from largest accounts.
+        
+        Uses authoritative mint supply from token_info, not sum of sampled accounts.
+        Classifies protocol-controlled bonding-curve accounts separately.
+        """
         if not largest_accounts:
             return {}
         
+        # Get authoritative mint supply from token_info (IMMUTABLE cache)
+        mint_supply = None
+        if token_info and token_info.get("supply") is not None:
+            try:
+                mint_supply = int(token_info["supply"])
+            except (ValueError, TypeError):
+                mint_supply = None
+        
         # Handle amount field which might be string from RPC
-        total_supply = 0
         amounts = []
+        account_data = []  # Track (address, amount) for protocol classification
         for acc in largest_accounts:
             amount = acc.get("amount", 0)
             if isinstance(amount, str):
@@ -714,24 +736,118 @@ class HeliusClient:
                 except ValueError:
                     amount = 0
             amounts.append(amount)
-            total_supply += amount
+            account_data.append({
+                "address": acc.get("address"),
+                "amount": amount,
+                "ui_amount": acc.get("uiAmount"),
+            })
             
-        if total_supply == 0:
+        if not amounts or all(a == 0 for a in amounts):
             return {}
         
         amounts.sort(reverse=True)
         
-        top_1 = amounts[0] / total_supply if amounts else 0
-        top_5 = sum(amounts[:5]) / total_supply if len(amounts) >= 5 else sum(amounts) / total_supply
-        top_10 = sum(amounts[:10]) / total_supply if len(amounts) >= 10 else 1.0
+        # Protocol account classification
+        protocol_balances = []
+        non_protocol_balances = []
+        unclassified_count = 0
+        protocol_addresses = []
         
-        return {
+        if bonding_curve_key and mint_supply is not None and mint_supply > 0:
+            # Fetch token account owners for verification
+            token_account_addresses = [a["address"] for a in account_data if a["address"]]
+            if token_account_addresses:
+                # Batch fetch token account info to get parsed owners
+                accounts_info = await self.get_multiple_accounts(token_account_addresses)
+                for i, info in enumerate(accounts_info):
+                    if i >= len(account_data):
+                        break
+                    amount = account_data[i]["amount"]
+                    if info and info.get("value") and info["value"].get("data", {}).get("parsed"):
+                        try:
+                            parsed_owner = info["value"]["data"]["parsed"]["info"]["owner"]
+                            if parsed_owner == bonding_curve_key:
+                                protocol_balances.append(amount)
+                                protocol_addresses.append(account_data[i]["address"])
+                            else:
+                                non_protocol_balances.append(amount)
+                        except (KeyError, TypeError):
+                            unclassified_count += 1
+                            non_protocol_balances.append(amount)
+                    else:
+                        unclassified_count += 1
+                        non_protocol_balances.append(amount)
+            else:
+                non_protocol_balances = amounts[:]
+        else:
+            # No bonding curve key or no mint supply - all non-protocol
+            non_protocol_balances = amounts[:]
+        
+        protocol_total = sum(protocol_balances)
+        non_protocol_total = sum(non_protocol_balances)
+        total_sampled = sum(amounts)
+        
+        # Calculate concentrations against authoritative mint supply
+        top_1_all = None
+        top_5_all = None
+        top_10_all = None
+        top_1_non_protocol = None
+        top_5_non_protocol = None
+        top_10_non_protocol = None
+        
+        missing_data_reason = None
+        
+        if mint_supply is not None and mint_supply > 0:
+            # All-account concentrations (including protocol)
+            top_1_all = round(amounts[0] / mint_supply * 100, 2) if amounts else 0.0
+            top_5_all = round(sum(amounts[:5]) / mint_supply * 100, 2)
+            top_10_all = round(sum(amounts[:10]) / mint_supply * 100, 2)
+            
+            # Non-protocol concentrations (excluding bonding-curve vault)
+            if non_protocol_total > 0:
+                non_protocol_amounts = sorted(non_protocol_balances, reverse=True)
+                top_1_non_protocol = round(non_protocol_amounts[0] / mint_supply * 100, 2) if non_protocol_amounts else 0.0
+                top_5_non_protocol = round(sum(non_protocol_amounts[:5]) / mint_supply * 100, 2)
+                top_10_non_protocol = round(sum(non_protocol_amounts[:10]) / mint_supply * 100, 2)
+            else:
+                top_1_non_protocol = 0.0
+                top_5_non_protocol = 0.0
+                top_10_non_protocol = 0.0
+        else:
+            missing_data_reason = "mint_supply_unavailable"
+        
+        result = {
             "total_holders_in_sample": len(largest_accounts),
-            "top_1_holder_pct": round(top_1 * 100, 2),
-            "top_5_holders_pct": round(top_5 * 100, 2),
-            "top_10_holders_pct": round(top_10 * 100, 2),
-            "total_supply_sampled": total_supply,
+            "sampled_balance_total": total_sampled,
+            "mint_supply": mint_supply,
+            "denominator_source": "token_info.supply" if mint_supply is not None else "missing",
+            "calculation_timestamp": time.time(),
+            "protocol_controlled_balance": protocol_total,
+            "protocol_accounts": protocol_addresses,
+            "unclassified_account_count": unclassified_count,
+            "non_protocol_balance_total": non_protocol_total,
+            "top_1_all_accounts_pct": top_1_all,
+            "top_5_all_accounts_pct": top_5_all,
+            "top_10_all_accounts_pct": top_10_all,
+            "top_1_non_protocol_pct": top_1_non_protocol,
+            "top_5_non_protocol_pct": top_5_non_protocol,
+            "top_10_non_protocol_pct": top_10_non_protocol,
+            "missing_data_reason": missing_data_reason,
         }
+        
+        # Backward compatibility - old field names (deprecated, will be removed)
+        if mint_supply is not None and mint_supply > 0:
+            result["top_1_holder_pct"] = top_1_all
+            result["top_5_holders_pct"] = top_5_all
+            result["top_10_holders_pct"] = top_10_all
+            result["total_supply_sampled"] = total_sampled
+        else:
+            result["top_1_holder_pct"] = None
+            result["top_5_holders_pct"] = None
+            result["top_10_holders_pct"] = None
+            result["total_supply_sampled"] = None
+        
+        return result
 
 
 class EnrichmentPipeline:

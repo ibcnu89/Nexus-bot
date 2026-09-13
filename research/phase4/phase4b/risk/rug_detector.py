@@ -176,12 +176,43 @@ class RugDetector:
     
     def _check_concentration(self, enrichment: Dict[str, Any], assessment: "RiskAssessment") -> None:
         """Check holder and creator concentration."""
-        # Holder concentration from holder_analysis
+        # Holder concentration from holder_analysis - use non-protocol values when available
         holder_analysis = enrichment.get("holder_analysis", {})
         
-        top_1 = holder_analysis.get("top_1_holder_pct", 0)
-        top_5 = holder_analysis.get("top_5_holders_pct", 0)
-        top_10 = holder_analysis.get("top_10_holders_pct", 0)
+        # Prefer non-protocol concentrations (excludes bonding-curve vault)
+        top_1 = holder_analysis.get("top_1_non_protocol_pct")
+        top_5 = holder_analysis.get("top_5_non_protocol_pct")
+        top_10 = holder_analysis.get("top_10_non_protocol_pct")
+        
+        # Fallback to all-account concentrations if non-protocol not available
+        if top_1 is None:
+            top_1 = holder_analysis.get("top_1_all_accounts_pct")
+        if top_5 is None:
+            top_5 = holder_analysis.get("top_5_all_accounts_pct")
+        if top_10 is None:
+            top_10 = holder_analysis.get("top_10_all_accounts_pct")
+        
+        # Backward compatibility: check deprecated field names
+        if top_1 is None:
+            top_1 = holder_analysis.get("top_1_holder_pct")
+        if top_5 is None:
+            top_5 = holder_analysis.get("top_5_holders_pct")
+        if top_10 is None:
+            top_10 = holder_analysis.get("top_10_holders_pct")
+        
+        # If all unavailable, missing data
+        if top_1 is None or top_5 is None or top_10 is None:
+            assessment.component_scores["concentration_unavailable"] = 10
+            assessment.risk_reasons.append("concentration_unavailable")
+            # Log the missing data reason
+            missing_reason = holder_analysis.get("missing_data_reason")
+            if missing_reason:
+                assessment.risk_reasons.append(f"concentration_missing_{missing_reason}")
+        
+        # Use 0 as default only if values are explicitly 0 (not None)
+        top_1 = top_1 if top_1 is not None else 0
+        top_5 = top_5 if top_5 is not None else 0
+        top_10 = top_10 if top_10 is not None else 0
         
         # Top 1 holder
         if top_1 >= self.thresholds.top_1_holder_pct_extreme:

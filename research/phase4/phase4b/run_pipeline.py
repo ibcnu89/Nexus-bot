@@ -90,7 +90,8 @@ class PipelineStats:
     raw_events: int = 0
     unique_mints: int = 0
     duplicate_count: int = 0
-
+    discovery_events_persisted: int = 0
+    
     # Pre-scoring
     candidates_pre_scored: int = 0
     candidates_passed: int = 0
@@ -122,6 +123,11 @@ class PipelineStats:
     # Outcome sampling
     outcomes_scheduled: int = 0
     outcomes_completed: int = 0
+    snapshots_due: int = 0
+    snapshots_inserted: int = 0
+    duplicate_snapshots_skipped: int = 0
+    missing_price_observations: int = 0
+    observation_errors: int = 0
 
     # Errors
     provider_failures: int = 0
@@ -142,6 +148,7 @@ class PipelineStats:
                 "raw_events": self.raw_events,
                 "unique_mints": self.unique_mints,
                 "duplicate_rate": round(self.duplicate_count / max(self.raw_events, 1), 4),
+                "events_persisted": self.discovery_events_persisted,
             },
             "pre_scoring": {
                 "candidates_scored": self.candidates_pre_scored,
@@ -175,6 +182,11 @@ class PipelineStats:
             "outcomes": {
                 "scheduled": self.outcomes_scheduled,
                 "completed": self.outcomes_completed,
+                "snapshots_due": self.snapshots_due,
+                "snapshots_inserted": self.snapshots_inserted,
+                "duplicate_snapshots_skipped": self.duplicate_snapshots_skipped,
+                "missing_price_observations": self.missing_price_observations,
+                "observation_errors": self.observation_errors,
             },
             "errors": {
                 "provider_failures": self.provider_failures,
@@ -329,6 +341,7 @@ class Phase4BPipeline:
             queue=self.discovery_queue,
             pumpportal_api_key=self.config.pumpportal_api_key,
             enable_fallback=self.config.enable_fallback,
+            db_path=self.config.db_path,
         )
 
         logger.info("Pipeline initialization complete")
@@ -1134,12 +1147,19 @@ class Phase4BPipeline:
             
             # Use actual component breakdown from meta engine
             component_breakdown = candidate.meta_component_breakdown if hasattr(candidate, 'meta_component_breakdown') else {}
-            discovery_score = component_breakdown.get("discovery_quality", candidate.pre_score * 20)
-            onchain_score = component_breakdown.get("onchain_quality", 20)
-            liquidity_score = component_breakdown.get("liquidity_execution", 10)
-            narrative_score = component_breakdown.get("narrative_momentum", 5)
-            creator_score = component_breakdown.get("creator_quality", 15)
-            risk_penalty = component_breakdown.get("risk_penalty", candidate.risk_score * 1.5)
+            discovery_score = component_breakdown.get("discovery_quality")
+            onchain_score = component_breakdown.get("onchain_quality")
+            liquidity_score = component_breakdown.get("liquidity_execution")
+            narrative_score = component_breakdown.get("narrative_momentum")
+            creator_score = component_breakdown.get("creator_quality")
+            risk_penalty = component_breakdown.get("risk_penalty")
+            
+            # Use actual values from meta engine, not synthetic fallbacks
+            expected_return_estimate = candidate.expected_return_estimate if hasattr(candidate, 'expected_return_estimate') else None
+            expected_downside = candidate.expected_downside if hasattr(candidate, 'expected_downside') else None
+            estimated_execution_cost = candidate.estimated_execution_cost if hasattr(candidate, 'estimated_execution_cost') else None
+            estimated_slippage = candidate.estimated_slippage if hasattr(candidate, 'estimated_slippage') else None
+            risk_adjusted_ev = candidate.risk_adjusted_ev if hasattr(candidate, 'risk_adjusted_ev') else None
             
             conn.execute("""
                 INSERT INTO meta_decisions
@@ -1154,8 +1174,10 @@ class Phase4BPipeline:
                 candidate.mint, None, time.time(),
                 discovery_score, onchain_score,
                 liquidity_score, narrative_score, creator_score, risk_penalty,
-                candidate.meta_score, candidate.meta_confidence, 0, 0, 0, 0, 0,
-                candidate.recommended_size_sol if hasattr(candidate, 'recommended_size_sol') else 0.0,
+                candidate.meta_score, candidate.meta_confidence,
+                expected_return_estimate, expected_downside,
+                estimated_execution_cost, estimated_slippage, risk_adjusted_ev,
+                candidate.recommended_size_sol if hasattr(candidate, 'recommended_size_sol') else None,
                 "approve" if candidate.meta_approved else "reject",
                 candidate.rejection_reason if hasattr(candidate, 'rejection_reason') else "",
                 "approve" if candidate.meta_approved else "reject",

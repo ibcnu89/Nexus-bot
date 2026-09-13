@@ -41,6 +41,7 @@ class PumpPortalDiscovery:
         max_reconnect_attempts: int = 10,
         base_reconnect_delay: float = 5.0,
         max_reconnect_delay: float = 300.0,
+        db_path: Optional[str] = None,
     ):
         self.api_key = api_key or os.environ.get("PUMPPORTAL_API_KEY")
         self.ws_url = ws_url or "wss://pumpportal.fun/api/data"
@@ -49,6 +50,7 @@ class PumpPortalDiscovery:
         
         self.queue = queue
         self.on_event = on_event
+        self.db_path = db_path
         
         # Reconnection config
         self.max_reconnect_attempts = max_reconnect_attempts
@@ -84,6 +86,7 @@ class PumpPortalDiscovery:
             "duplicate_count": self._duplicate_count,
             "malformed_count": self._malformed_count,
             "last_message_age_sec": time.time() - self._last_message_time if self._last_message_time else None,
+            "discovery_events_persisted": self._message_count - self._malformed_count - self._duplicate_count,
         }
     
     async def start(self) -> None:
@@ -236,12 +239,54 @@ class PumpPortalDiscovery:
             if candidate.duplicate_count > 1:
                 self._duplicate_count += 1
         
+        # Persist discovery event to database
+        if self.db_path:
+            await self._persist_discovery_event(event)
+        
         # Call callback if provided
         if self.on_event:
             try:
                 self.on_event(event)
             except Exception as e:
                 logger.error(f"Event callback error: {e}")
+    
+    async def _persist_discovery_event(self, event: DiscoveryEvent) -> None:
+        """Persist raw discovery event to database."""
+        try:
+            import sqlite3
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("""
+                INSERT INTO discovery_events
+                (mint, source, event_timestamp, receive_timestamp, symbol, name,
+                 creator, uri, bonding_curve_key, initial_buy, sol_amount,
+                 v_tokens_in_bonding_curve, v_sol_in_bonding_curve, market_cap_sol,
+                 is_mayhem_mode, pool, signature, raw_payload, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                event.mint,
+                event.source.value,
+                event.event_timestamp,
+                event.receive_timestamp,
+                event.symbol,
+                event.name,
+                event.creator,
+                event.uri,
+                event.bonding_curve_key,
+                event.initial_buy,
+                event.sol_amount,
+                event.v_tokens_in_bonding_curve,
+                event.v_sol_in_bonding_curve,
+                event.market_cap_sol,
+                1 if event.is_mayhem_mode else 0 if event.is_mayhem_mode is not None else None,
+                event.pool,
+                event.signature,
+                json.dumps(event.raw_payload) if event.raw_payload else None,
+                time.time()
+            ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Failed to persist discovery event: {e}")
     
     def get_stats(self) -> dict:
         return {
@@ -268,11 +313,13 @@ class SolanaPublicRPCDiscovery:
         program_id: str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
         queue: Optional["DiscoveryQueue"] = None,
         on_event: Optional[Callable[[DiscoveryEvent], None]] = None,
+        db_path: Optional[str] = None,
     ):
         self.rpc_url = rpc_url
         self.program_id = program_id
         self.queue = queue
         self.on_event = on_event
+        self.db_path = db_path
         
         self._ws: Optional[websockets.ClientConnection] = None
         self._running = False
@@ -431,6 +478,48 @@ class SolanaPublicRPCDiscovery:
                 self.on_event(event)
             except Exception as e:
                 logger.error(f"Event callback error: {e}")
+        
+        # Persist discovery event to database
+        if self.db_path:
+            await self._persist_discovery_event(event)
+    
+    async def _persist_discovery_event(self, event: DiscoveryEvent) -> None:
+        """Persist raw discovery event to database."""
+        try:
+            import sqlite3
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("""
+                INSERT INTO discovery_events
+                (mint, source, event_timestamp, receive_timestamp, symbol, name,
+                 creator, uri, bonding_curve_key, initial_buy, sol_amount,
+                 v_tokens_in_bonding_curve, v_sol_in_bonding_curve, market_cap_sol,
+                 is_mayhem_mode, pool, signature, raw_payload, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                event.mint,
+                event.source.value,
+                event.event_timestamp,
+                event.receive_timestamp,
+                event.symbol,
+                event.name,
+                event.creator,
+                event.uri,
+                event.bonding_curve_key,
+                event.initial_buy,
+                event.sol_amount,
+                event.v_tokens_in_bonding_curve,
+                event.v_sol_in_bonding_curve,
+                event.market_cap_sol,
+                1 if event.is_mayhem_mode else 0 if event.is_mayhem_mode is not None else None,
+                event.pool,
+                event.signature,
+                json.dumps(event.raw_payload) if event.raw_payload else None,
+                time.time()
+            ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Failed to persist discovery event: {e}")
     
     async def shutdown(self) -> None:
         self._running = False
@@ -466,20 +555,23 @@ class DiscoveryManager:
         queue: DiscoveryQueue,
         pumpportal_api_key: Optional[str] = None,
         enable_fallback: bool = True,
+        db_path: Optional[str] = None,
     ):
         self.queue = queue
         self.enable_fallback = enable_fallback
+        self.db_path = db_path
         
         # Primary: PumpPortal
         self.pumpportal = PumpPortalDiscovery(
             api_key=pumpportal_api_key,
             queue=queue,
+            db_path=db_path,
         )
         
         # Fallback: Public RPC
         self.fallback = None
         if enable_fallback:
-            self.fallback = SolanaPublicRPCDiscovery(queue=queue)
+            self.fallback = SolanaPublicRPCDiscovery(queue=queue, db_path=db_path)
         
         self._running = False
         self._tasks: list = []
