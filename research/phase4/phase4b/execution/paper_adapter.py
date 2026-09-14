@@ -470,9 +470,9 @@ class PaperExecutionAdapter:
             # Update PaperPosition (triggers exit logic)
             triggers = position.update_market_data(
                 price=exec_quote.quoted_execution_price,
-                liquidity_usd=0,  # Would come from enrichment
-                market_cap_usd=0,
-                volume_24h_usd=0,
+                liquidity_usd=None,
+                market_cap_usd=None,
+                volume_24h_usd=None,
                 quote=proto_quote
             )
             
@@ -563,12 +563,12 @@ class PaperExecutionAdapter:
             # We'd ideally get a fresh quote here, but for efficiency
             # we can use the last known quote or skip quote for update
             triggers = position.update_market_data(
-                price=data.get("price", 0),
-                liquidity_usd=data.get("liquidity_usd", 0),
-                market_cap_usd=data.get("market_cap_usd", 0),
-                volume_24h_usd=data.get("volume_24h_usd", 0),
-                buy_volume=data.get("buy_volume", 0),
-                sell_volume=data.get("sell_volume", 0),
+                price=data["price"],
+                liquidity_usd=data.get("liquidity_usd"),
+                market_cap_usd=data.get("market_cap_usd"),
+                volume_24h_usd=data.get("volume_24h_usd"),
+                buy_volume=data.get("buy_volume"),
+                sell_volume=data.get("sell_volume"),
                 quote=None  # No fresh quote for periodic updates
             )
             
@@ -613,7 +613,7 @@ class PaperExecutionAdapter:
             "initial_tokens": float(ledger.initial_tokens),
             "realized_pnl_sol": float(ledger.realized_pnl_sol),
             "realized_proceeds_sol": float(ledger.realized_proceeds_sol),
-            "unrealized_pnl_sol": 0.0,  # Would need current price
+            "unrealized_pnl_sol": None,
             "fees_paid_sol": float(ledger.total_network_costs_sol),
             "weighted_exit_price": position.weighted_exit_price,
         }

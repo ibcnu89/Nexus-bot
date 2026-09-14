@@ -181,11 +181,11 @@ class PositionEvent:
     event: str
     mint: str
     price: float
-    liquidity_usd: float
-    market_cap_usd: float
-    volume_24h_usd: float
-    buy_volume: float
-    sell_volume: float
+    liquidity_usd: Optional[float]
+    market_cap_usd: Optional[float]
+    volume_24h_usd: Optional[float]
+    buy_volume: Optional[float]
+    sell_volume: Optional[float]
     trigger: Optional[str] = None
     position_value_sol: float = 0.0
     high_water_mark: float = 0.0
@@ -258,11 +258,11 @@ class PaperPosition:
         self._log_event(
             event="ENTRY",
             price=self.entry_price,
-            liquidity_usd=0.0,
-            market_cap_usd=0.0,
-            volume_24h_usd=0.0,
-            buy_volume=0.0,
-            sell_volume=0.0,
+            liquidity_usd=None,
+            market_cap_usd=None,
+            volume_24h_usd=None,
+            buy_volume=None,
+            sell_volume=None,
             position_value_sol=self.size_sol,
             stop_level=self.initial_stop_price,
             tokens_remaining=self.tokens_remaining,
@@ -354,11 +354,11 @@ class PaperPosition:
     def update_market_data(
         self,
         price: float,
-        liquidity_usd: float,
-        market_cap_usd: float,
-        volume_24h_usd: float,
-        buy_volume: float = 0.0,
-        sell_volume: float = 0.0,
+        liquidity_usd: Optional[float],
+        market_cap_usd: Optional[float],
+        volume_24h_usd: Optional[float],
+        buy_volume: Optional[float] = None,
+        sell_volume: Optional[float] = None,
         quote: Optional[PriceQuote] = None
     ) -> list[ExitTrigger]:
         """
@@ -370,7 +370,7 @@ class PaperPosition:
 
         with self._lock:
             # Update peak liquidity
-            if liquidity_usd > self.peak_liquidity_usd:
+            if liquidity_usd is not None and liquidity_usd > self.peak_liquidity_usd:
                 self.peak_liquidity_usd = liquidity_usd
 
             # Update high water mark
@@ -384,8 +384,10 @@ class PaperPosition:
                 self.recent_buy_volume = 0.0
                 self.recent_sell_volume = 0.0
                 self.volume_window_start = now
-            self.recent_buy_volume += buy_volume
-            self.recent_sell_volume += sell_volume
+            volume_observed = buy_volume is not None and sell_volume is not None
+            if volume_observed:
+                self.recent_buy_volume += buy_volume
+                self.recent_sell_volume += sell_volume
 
             # Use executable price for exit evaluation
             eval_price = quote.net_price_after_fees if quote else price
@@ -425,15 +427,16 @@ class PaperPosition:
                     triggers.append(ExitTrigger.TIME_EXIT)
 
             # 6. Check liquidity exits
-            if liquidity_usd < self.config.min_liquidity_usd:
-                triggers.append(ExitTrigger.LIQUIDITY_EXIT)
-            elif self.peak_liquidity_usd > 0:
-                liquidity_drop = 1 - (liquidity_usd / self.peak_liquidity_usd)
-                if liquidity_drop >= self.config.liquidity_drop_pct:
+            if liquidity_usd is not None:
+                if liquidity_usd < self.config.min_liquidity_usd:
                     triggers.append(ExitTrigger.LIQUIDITY_EXIT)
+                elif self.peak_liquidity_usd > 0:
+                    liquidity_drop = 1 - (liquidity_usd / self.peak_liquidity_usd)
+                    if liquidity_drop >= self.config.liquidity_drop_pct:
+                        triggers.append(ExitTrigger.LIQUIDITY_EXIT)
 
             # 7. Check sell pressure
-            if self.recent_buy_volume > 0:
+            if volume_observed and self.recent_buy_volume > 0:
                 sell_buy_ratio = self.recent_sell_volume / self.recent_buy_volume
                 if sell_buy_ratio >= self.config.sell_buy_ratio_threshold:
                     triggers.append(ExitTrigger.SELL_PRESSURE_EXIT)
@@ -512,8 +515,8 @@ class PaperPosition:
                 self._log_event(
                     event="TRAILING_STOP_ACTIVATED",
                     price=new_high_price,
-                    liquidity_usd=0, market_cap_usd=0, volume_24h_usd=0,
-                    buy_volume=0, sell_volume=0,
+                    liquidity_usd=None, market_cap_usd=None, volume_24h_usd=None,
+                    buy_volume=None, sell_volume=None,
                     trigger="trail_activated",
                     high_water_mark=self.high_water_mark,
                     stop_level=self.trailing_stop_price,
@@ -534,8 +537,8 @@ class PaperPosition:
                 self._log_event(
                     event="STOP_RATCHETED",
                     price=new_high_price,
-                    liquidity_usd=0, market_cap_usd=0, volume_24h_usd=0,
-                    buy_volume=0, sell_volume=0,
+                    liquidity_usd=None, market_cap_usd=None, volume_24h_usd=None,
+                    buy_volume=None, sell_volume=None,
                     trigger="ratchet",
                     high_water_mark=self.high_water_mark,
                     stop_level=self.trailing_stop_price,
@@ -558,8 +561,8 @@ class PaperPosition:
             self._log_event(
                 event="BREAKEVEN_SECURED",
                 price=new_high_price,
-                liquidity_usd=0, market_cap_usd=0, volume_24h_usd=0,
-                buy_volume=0, sell_volume=0,
+                liquidity_usd=None, market_cap_usd=None, volume_24h_usd=None,
+                buy_volume=None, sell_volume=None,
                 trigger="breakeven",
                 high_water_mark=self.high_water_mark,
                 stop_level=self.breakeven_stop_price,
@@ -604,8 +607,8 @@ class PaperPosition:
             self._log_event(
                 event="SIMULATED_FILL",
                 price=exit_price,
-                liquidity_usd=0, market_cap_usd=0, volume_24h_usd=0,
-                buy_volume=0, sell_volume=0,
+                liquidity_usd=None, market_cap_usd=None, volume_24h_usd=None,
+                buy_volume=None, sell_volume=None,
                 trigger=trigger.value,
                 position_value_sol=self.realized_proceeds_sol,
                 high_water_mark=self.high_water_mark,
@@ -624,8 +627,8 @@ class PaperPosition:
             self._log_event(
                 event="FINAL_PNL",
                 price=exit_price,
-                liquidity_usd=0, market_cap_usd=0, volume_24h_usd=0,
-                buy_volume=0, sell_volume=0,
+                liquidity_usd=None, market_cap_usd=None, volume_24h_usd=None,
+                buy_volume=None, sell_volume=None,
                 trigger=trigger.value,
                 position_value_sol=0.0,
                 high_water_mark=self.high_water_mark,

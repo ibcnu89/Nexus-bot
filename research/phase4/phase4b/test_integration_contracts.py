@@ -430,6 +430,11 @@ def test_unknown_narrative_is_evaluated_once():
 
     pipeline = object.__new__(Phase4BPipeline)
     pipeline.discovery_queue = queue
+    pipeline.stats = SimpleNamespace(
+        narrative_evaluations=0,
+        narrative_missing_data=0,
+        narrative_unknown=0,
+    )
 
     async def persist(*args):
         return None
@@ -445,3 +450,6 @@ def test_unknown_narrative_is_evaluated_once():
     asyncio.run(run_twice())
     assert engine.calls == 1
     assert candidate.narrative_evaluated is True
+    assert pipeline.stats.narrative_evaluations == 1
+    assert pipeline.stats.narrative_missing_data == 1
+    assert pipeline.stats.narrative_unknown == 1

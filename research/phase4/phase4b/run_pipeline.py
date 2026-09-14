@@ -110,11 +110,17 @@ class PipelineStats:
     risk_moderate: int = 0
     risk_high: int = 0
 
+    # Narrative
+    narrative_evaluations: int = 0
+    narrative_missing_data: int = 0
+    narrative_unknown: int = 0
+
     # Meta
     meta_approved: int = 0
     meta_rejected: int = 0
 
     # Execution
+    paper_entry_attempts: int = 0
     paper_entries: int = 0
     paper_exits: int = 0
     partial_exits: int = 0
@@ -179,11 +185,17 @@ class PipelineStats:
                 "moderate": self.risk_moderate,
                 "high": self.risk_high,
             },
+            "narrative": {
+                "evaluations": self.narrative_evaluations,
+                "missing_data": self.narrative_missing_data,
+                "unknown": self.narrative_unknown,
+            },
             "meta": {
                 "approved": self.meta_approved,
                 "rejected": self.meta_rejected,
             },
             "execution": {
+                "entry_attempts": self.paper_entry_attempts,
                 "entries": self.paper_entries,
                 "exits": self.paper_exits,
                 "partial_exits": self.partial_exits,
@@ -671,6 +683,11 @@ class Phase4BPipeline:
             candidate.narrative_missing_data = narrative_signal.get("missing_data", True)
             candidate.narrative_unknown_state = narrative_signal.get("unknown_state", True)
             candidate.narrative_evaluated = True
+            self.stats.narrative_evaluations += 1
+            if candidate.narrative_missing_data:
+                self.stats.narrative_missing_data += 1
+            if candidate.narrative_category == "unknown" or candidate.narrative_unknown_state:
+                self.stats.narrative_unknown += 1
             
             # Persist narrative
             await self._persist_narrative(candidate, narrative_signal)
@@ -813,6 +830,7 @@ class Phase4BPipeline:
             )
 
             # Execute entry
+            self.stats.paper_entry_attempts += 1
             result = await self.paper_adapter.execute_entry(intent)
 
             if result.success:

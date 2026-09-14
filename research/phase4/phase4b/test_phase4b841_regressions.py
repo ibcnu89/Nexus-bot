@@ -25,6 +25,11 @@ from research.phase4.phase4b.run_pipeline import Phase4BPipeline, PipelineStats
 from research.phase4.phase4b.scoring.meta_engine import MetaEngine
 from research.phase4.phase4b.scoring.pre_score import PreScorer
 from research.phase4.phase4b.storage.database import SCHEMA_SQL
+from research.phase4.prototype.paper_position_manager import (
+    ExitConfig,
+    ExitTrigger,
+    PaperPosition,
+)
 from research.phase4.prototype.price_source import BondingCurveState, PriceSource
 
 
@@ -561,8 +566,10 @@ def test_real_pipeline_methods_reach_one_idempotent_paper_fill_and_outcome(tmp_p
     assert pipeline.stats.candidates_passed == 1
     assert target.risk_class == "LOW"
     assert target.narrative_evaluated is True
+    assert pipeline.stats.narrative_evaluations == 1
     assert target.meta_approved is True
     assert target.paper_entered is True
+    assert pipeline.stats.paper_entry_attempts == 1
     assert pipeline.stats.paper_entries == 1
 
     conn = sqlite3.connect(db_path)
@@ -577,3 +584,49 @@ def test_real_pipeline_methods_reach_one_idempotent_paper_fill_and_outcome(tmp_p
         "SELECT COUNT(*) FROM outcome_snapshots WHERE candidate_mint = 'target-mint'"
     ).fetchone()[0] == 2
     conn.close()
+
+
+def test_position_update_treats_missing_liquidity_as_unknown_not_zero():
+    position = PaperPosition(
+        mint="unknown-market-data",
+        symbol="UNK",
+        entry_price=1.0,
+        entry_time=time.time(),
+        size_sol=0.02,
+        config=ExitConfig(),
+    )
+
+    adapter = PaperExecutionAdapter(price_source=PriceSource())
+    adapter.positions[position.mint] = position
+    all_triggers = adapter.update_positions({
+        position.mint: {
+            "price": 1.01,
+            "liquidity_usd": None,
+            "market_cap_usd": None,
+            "volume_24h_usd": None,
+        }
+    })
+    triggers = all_triggers.get(position.mint, [])
+
+    assert ExitTrigger.LIQUIDITY_EXIT not in triggers
+    assert ExitTrigger.SELL_PRESSURE_EXIT not in triggers
+    assert position.events[0].liquidity_usd is None
+    assert position.events[-1].liquidity_usd is None
+    assert position.events[-1].market_cap_usd is None
+    assert position.events[-1].volume_24h_usd is None
+
+
+def test_pipeline_stats_count_narrative_and_entry_attempts():
+    stats = PipelineStats(start_time=time.time())
+    stats.narrative_evaluations = 2
+    stats.narrative_missing_data = 1
+    stats.narrative_unknown = 1
+    stats.paper_entry_attempts = 1
+
+    report = stats.to_dict()
+    assert report["narrative"] == {
+        "evaluations": 2,
+        "missing_data": 1,
+        "unknown": 1,
+    }
+    assert report["execution"]["entry_attempts"] == 1
