@@ -61,10 +61,17 @@ class PumpPortalDiscovery:
         self._ws: Optional[websockets.ClientConnection] = None
         self._running = False
         self._reconnect_count = 0
+        self._reconnect_attempts_total = 0
+        self._disconnect_count = 0
         self._last_message_time = 0.0
         self._message_count = 0
+        self._valid_discovery_count = 0
+        self._persisted_count = 0
         self._duplicate_count = 0
         self._malformed_count = 0
+        self._subscription_count = 0
+        self._other_message_count = 0
+        self._persistence_failure_count = 0
         
         # Subscription message
         self._subscribe_msg = json.dumps({"method": "subscribeNewToken"})
@@ -81,12 +88,18 @@ class PumpPortalDiscovery:
     def stats(self) -> dict:
         return {
             "connected": self.is_connected,
-            "reconnect_count": self._reconnect_count,
+            "reconnect_count": self._reconnect_attempts_total,
+            "disconnect_count": self._disconnect_count,
             "message_count": self._message_count,
+            "valid_discovery_events": self._valid_discovery_count,
+            "unique_mints": self._valid_discovery_count - self._duplicate_count,
             "duplicate_count": self._duplicate_count,
             "malformed_count": self._malformed_count,
+            "subscription_count": self._subscription_count,
+            "other_message_count": self._other_message_count,
+            "persistence_failure_count": self._persistence_failure_count,
             "last_message_age_sec": time.time() - self._last_message_time if self._last_message_time else None,
-            "discovery_events_persisted": self._message_count - self._malformed_count - self._duplicate_count,
+            "discovery_events_persisted": self._persisted_count,
         }
     
     async def start(self) -> None:
@@ -100,6 +113,9 @@ class PumpPortalDiscovery:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                if self._ws is not None:
+                    self._disconnect_count += 1
+                    self._ws = None
                 logger.error(f"Discovery loop error: {e}")
             
             if not self._running:
@@ -117,6 +133,7 @@ class PumpPortalDiscovery:
             logger.info(f"Reconnecting in {delay:.1f}s (attempt {self._reconnect_count + 1}/{self.max_reconnect_attempts})")
             await asyncio.sleep(delay)
             self._reconnect_count += 1
+            self._reconnect_attempts_total += 1
     
     async def shutdown(self) -> None:
         """Stop the discovery loop."""
@@ -164,6 +181,10 @@ class PumpPortalDiscovery:
                     except Exception:
                         logger.warning("Ping failed, connection may be stale")
                         break
+
+        if self._running:
+            self._disconnect_count += 1
+        self._ws = None
     
     async def _process_message(self, message) -> None:
         """Process incoming WebSocket message."""
@@ -183,6 +204,7 @@ class PumpPortalDiscovery:
         
         # Handle subscription confirmation
         if isinstance(data, dict) and data.get("method") == "subscribeNewToken":
+            self._subscription_count += 1
             logger.info(f"Subscription confirmed: {data}")
             return
         
@@ -194,6 +216,7 @@ class PumpPortalDiscovery:
             return
         
         # Other message types
+        self._other_message_count += 1
         logger.debug(f"Other message: {data}")
     
     def _parse_token_event(self, data: dict) -> Optional[DiscoveryEvent]:
@@ -233,15 +256,20 @@ class PumpPortalDiscovery:
     
     async def _handle_event(self, event: DiscoveryEvent) -> None:
         """Handle a parsed discovery event."""
+        self._valid_discovery_count += 1
         # Add to queue if available
         if self.queue:
+            was_duplicate = self.queue.get_candidate(event.mint) is not None
             candidate = self.queue.add_or_update(event)
-            if candidate.duplicate_count > 1:
+            if was_duplicate:
                 self._duplicate_count += 1
         
         # Persist discovery event to database
         if self.db_path:
-            await self._persist_discovery_event(event)
+            if await self._persist_discovery_event(event):
+                self._persisted_count += 1
+            else:
+                self._persistence_failure_count += 1
         
         # Call callback if provided
         if self.on_event:
@@ -250,8 +278,9 @@ class PumpPortalDiscovery:
             except Exception as e:
                 logger.error(f"Event callback error: {e}")
     
-    async def _persist_discovery_event(self, event: DiscoveryEvent) -> None:
+    async def _persist_discovery_event(self, event: DiscoveryEvent) -> bool:
         """Persist raw discovery event to database."""
+        conn = None
         try:
             import sqlite3
             conn = sqlite3.connect(self.db_path)
@@ -284,20 +313,18 @@ class PumpPortalDiscovery:
                 time.time()
             ))
             conn.commit()
-            conn.close()
+            return True
         except Exception as e:
             logger.error(f"Failed to persist discovery event: {e}")
+            return False
+        finally:
+            if conn is not None:
+                conn.close()
     
     def get_stats(self) -> dict:
-        return {
-            "connected": self.is_connected,
-            "reconnect_count": self._reconnect_count,
-            "message_count": self._message_count,
-            "duplicate_count": self._duplicate_count,
-            "malformed_count": self._malformed_count,
-            "last_message_age_sec": time.time() - self._last_message_time if self._last_message_time else None,
-            "queue_stats": self.queue.stats() if self.queue else None,
-        }
+        stats = dict(self.stats)
+        stats["queue_stats"] = self.queue.stats() if self.queue else None
+        return stats
 
 
 class SolanaPublicRPCDiscovery:
@@ -327,6 +354,10 @@ class SolanaPublicRPCDiscovery:
         
         self._message_count = 0
         self._parse_errors = 0
+        self._valid_discovery_count = 0
+        self._persisted_count = 0
+        self._duplicate_count = 0
+        self._persistence_failure_count = 0
     
     @property
     def is_connected(self) -> bool:
@@ -471,8 +502,12 @@ class SolanaPublicRPCDiscovery:
             return None
     
     async def _handle_event(self, event: DiscoveryEvent) -> None:
+        self._valid_discovery_count += 1
         if self.queue:
+            was_duplicate = self.queue.get_candidate(event.mint) is not None
             self.queue.add_or_update(event)
+            if was_duplicate:
+                self._duplicate_count += 1
         if self.on_event:
             try:
                 self.on_event(event)
@@ -481,10 +516,14 @@ class SolanaPublicRPCDiscovery:
         
         # Persist discovery event to database
         if self.db_path:
-            await self._persist_discovery_event(event)
+            if await self._persist_discovery_event(event):
+                self._persisted_count += 1
+            else:
+                self._persistence_failure_count += 1
     
-    async def _persist_discovery_event(self, event: DiscoveryEvent) -> None:
+    async def _persist_discovery_event(self, event: DiscoveryEvent) -> bool:
         """Persist raw discovery event to database."""
+        conn = None
         try:
             import sqlite3
             conn = sqlite3.connect(self.db_path)
@@ -517,9 +556,25 @@ class SolanaPublicRPCDiscovery:
                 time.time()
             ))
             conn.commit()
-            conn.close()
+            return True
         except Exception as e:
             logger.error(f"Failed to persist discovery event: {e}")
+            return False
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def get_stats(self) -> dict:
+        return {
+            "connected": self.is_connected,
+            "message_count": self._message_count,
+            "valid_discovery_events": self._valid_discovery_count,
+            "unique_mints": self._valid_discovery_count - self._duplicate_count,
+            "duplicate_count": self._duplicate_count,
+            "malformed_count": self._parse_errors,
+            "discovery_events_persisted": self._persisted_count,
+            "persistence_failure_count": self._persistence_failure_count,
+        }
     
     async def shutdown(self) -> None:
         self._running = False
@@ -612,9 +667,20 @@ class DiscoveryManager:
             "pumpportal": self.pumpportal.get_stats(),
         }
         if self.fallback:
-            stats["fallback"] = {
-                "connected": self.fallback.is_connected,
-                "message_count": self.fallback._message_count,
-                "parse_errors": self.fallback._parse_errors,
-            }
+            stats["fallback"] = self.fallback.get_stats()
+
+        sources = list(stats.values())
+        stats["totals"] = {
+            "message_count": sum(source.get("message_count", 0) for source in sources),
+            "valid_discovery_events": sum(source.get("valid_discovery_events", 0) for source in sources),
+            "duplicate_count": sum(source.get("duplicate_count", 0) for source in sources),
+            "discovery_events_persisted": sum(
+                source.get("discovery_events_persisted", 0) for source in sources
+            ),
+            "persistence_failure_count": sum(
+                source.get("persistence_failure_count", 0) for source in sources
+            ),
+            # The shared queue is authoritative across discovery sources.
+            "unique_mints": self.queue.stats()["total"],
+        }
         return stats

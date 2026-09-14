@@ -176,65 +176,64 @@ class RugDetector:
     
     def _check_concentration(self, enrichment: Dict[str, Any], assessment: "RiskAssessment") -> None:
         """Check holder and creator concentration."""
-        # Holder concentration from holder_analysis - use non-protocol values when available
+        # Use protocol-excluded balances only when every sampled account owner was
+        # resolved. Otherwise retain the conservative all-account measurement and
+        # explicitly mark the protocol classification as incomplete.
         holder_analysis = enrichment.get("holder_analysis", {})
-        
-        # Prefer non-protocol concentrations (excludes bonding-curve vault)
-        top_1 = holder_analysis.get("top_1_non_protocol_pct")
-        top_5 = holder_analysis.get("top_5_non_protocol_pct")
-        top_10 = holder_analysis.get("top_10_non_protocol_pct")
-        
-        # Fallback to all-account concentrations if non-protocol not available
-        if top_1 is None:
+
+        if holder_analysis.get("holder_classification_complete") is True:
+            top_1 = holder_analysis.get("top_1_non_protocol_pct_total_supply")
+            top_5 = holder_analysis.get("top_5_non_protocol_pct_total_supply")
+            top_10 = holder_analysis.get("top_10_non_protocol_pct_total_supply")
+        else:
             top_1 = holder_analysis.get("top_1_all_accounts_pct")
-        if top_5 is None:
             top_5 = holder_analysis.get("top_5_all_accounts_pct")
-        if top_10 is None:
             top_10 = holder_analysis.get("top_10_all_accounts_pct")
-        
-        # Backward compatibility: check deprecated field names
-        if top_1 is None:
+            if holder_analysis and any(
+                key in holder_analysis
+                for key in ("holder_classification_complete", "unclassified_account_count")
+            ):
+                assessment.missing_data_indicators.append("holder_owner_classification_incomplete")
+                assessment.risk_reasons.append("holder_owner_classification_incomplete")
+
+        # Support historical fixtures/records which predate explicit protocol
+        # classification. These values still mean percentage of total mint supply.
+        if top_1 is None and "top_1_holder_pct" in holder_analysis:
             top_1 = holder_analysis.get("top_1_holder_pct")
-        if top_5 is None:
+        if top_5 is None and "top_5_holders_pct" in holder_analysis:
             top_5 = holder_analysis.get("top_5_holders_pct")
-        if top_10 is None:
+        if top_10 is None and "top_10_holders_pct" in holder_analysis:
             top_10 = holder_analysis.get("top_10_holders_pct")
-        
-        # If all unavailable, missing data
+
         if top_1 is None or top_5 is None or top_10 is None:
             assessment.component_scores["concentration_unavailable"] = 10
             assessment.risk_reasons.append("concentration_unavailable")
-            # Log the missing data reason
+            assessment.missing_data_indicators.append("concentration_unavailable")
             missing_reason = holder_analysis.get("missing_data_reason")
             if missing_reason:
                 assessment.risk_reasons.append(f"concentration_missing_{missing_reason}")
-        
-        # Use 0 as default only if values are explicitly 0 (not None)
-        top_1 = top_1 if top_1 is not None else 0
-        top_5 = top_5 if top_5 is not None else 0
-        top_10 = top_10 if top_10 is not None else 0
-        
+
         # Top 1 holder
-        if top_1 >= self.thresholds.top_1_holder_pct_extreme:
+        if top_1 is not None and top_1 >= self.thresholds.top_1_holder_pct_extreme:
             assessment.component_scores["top_1_holder_extreme"] = 30
             assessment.risk_reasons.append(f"top_1_holder_{top_1:.1f}pct_extreme")
-        elif top_1 >= self.thresholds.top_1_holder_pct_high:
+        elif top_1 is not None and top_1 >= self.thresholds.top_1_holder_pct_high:
             assessment.component_scores["top_1_holder_high"] = 15
             assessment.risk_reasons.append(f"top_1_holder_{top_1:.1f}pct_high")
         
         # Top 5 holders
-        if top_5 >= self.thresholds.top_5_holders_pct_extreme:
+        if top_5 is not None and top_5 >= self.thresholds.top_5_holders_pct_extreme:
             assessment.component_scores["top_5_holders_extreme"] = 25
             assessment.risk_reasons.append(f"top_5_holders_{top_5:.1f}pct_extreme")
-        elif top_5 >= self.thresholds.top_5_holders_pct_high:
+        elif top_5 is not None and top_5 >= self.thresholds.top_5_holders_pct_high:
             assessment.component_scores["top_5_holders_high"] = 12
             assessment.risk_reasons.append(f"top_5_holders_{top_5:.1f}pct_high")
         
         # Top 10 holders
-        if top_10 >= self.thresholds.top_10_holders_pct_extreme:
+        if top_10 is not None and top_10 >= self.thresholds.top_10_holders_pct_extreme:
             assessment.component_scores["top_10_holders_extreme"] = 30
             assessment.risk_reasons.append(f"top_10_holders_{top_10:.1f}pct_extreme")
-        elif top_10 >= self.thresholds.top_10_holders_pct_high:
+        elif top_10 is not None and top_10 >= self.thresholds.top_10_holders_pct_high:
             assessment.component_scores["top_10_holders_high"] = 15
             assessment.risk_reasons.append(f"top_10_holders_{top_10:.1f}pct_high")
         

@@ -275,6 +275,8 @@ CREATE TABLE IF NOT EXISTS outcome_snapshots (
 CREATE INDEX IF NOT EXISTS idx_outcomes_mint ON outcome_snapshots(candidate_mint);
 CREATE INDEX IF NOT EXISTS idx_outcomes_horizon ON outcome_snapshots(horizon_seconds);
 CREATE INDEX IF NOT EXISTS idx_outcomes_obs_time ON outcome_snapshots(observation_time);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_outcomes_mint_horizon_unique
+    ON outcome_snapshots(candidate_mint, horizon_seconds);
 
 -- Provider usage
 CREATE TABLE IF NOT EXISTS provider_usage (

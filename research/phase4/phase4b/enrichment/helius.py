@@ -257,7 +257,18 @@ class HeliusClient:
         self._token_cache: Dict[str, Dict] = {}  # mint -> {decimals, supply, authorities}
         self._bonding_curve_accounts: Dict[str, tuple[str, int]] = {}
         self._last_bonding_curve_states: Dict[str, Any] = {}
-        
+        self._provider_metrics_started_at = time.time()
+        self._provider_metrics = {
+            "requests": 0,
+            "successful_requests": 0,
+            "http_429": 0,
+            "timeouts": 0,
+            "retries": 0,
+            "governor_skips": 0,
+            "failed_calls": 0,
+            "latencies_ms": [],
+            "request_times": [],
+        }
         # RPC method credit costs
         self.credit_costs = {
             "getAccountInfo": 1,
@@ -299,6 +310,7 @@ class HeliusClient:
         allowed, reason = self.governor.can_proceed(cost)
         if not allowed:
             logger.warning(f"Governor blocked {method}: {reason}")
+            self._provider_metrics["governor_skips"] += 1
             return None
         
         # Check cache
@@ -316,6 +328,11 @@ class HeliusClient:
         }
         
         for attempt in range(self.max_retries):
+            if attempt > 0:
+                self._provider_metrics["retries"] += 1
+            self._provider_metrics["requests"] += 1
+            self._provider_metrics["request_times"].append(time.time())
+            request_started = time.perf_counter()
             try:
                 async with session.post(self.rpc_url, json=payload) as resp:
                     if resp.status == 200:
@@ -323,25 +340,67 @@ class HeliusClient:
                         if "result" in data:
                             # Record credit usage
                             self.governor.record_usage(method)
+                            self._provider_metrics["successful_requests"] += 1
                             return data["result"]
                         elif "error" in data:
                             logger.warning(f"RPC error: {data['error']}")
                     elif resp.status == 429:
+                        self._provider_metrics["http_429"] += 1
                         wait = 2 ** attempt
                         logger.warning(f"Rate limited, waiting {wait}s")
                         await asyncio.sleep(wait)
                     else:
                         logger.warning(f"HTTP {resp.status} from Helius")
             except asyncio.TimeoutError:
+                self._provider_metrics["timeouts"] += 1
                 logger.warning(f"Timeout calling {method} (attempt {attempt + 1})")
             except Exception as e:
                 logger.warning(f"Error calling {method}: {e}")
+            finally:
+                self._provider_metrics["latencies_ms"].append(
+                    (time.perf_counter() - request_started) * 1000
+                )
             
             if attempt < self.max_retries - 1:
                 await asyncio.sleep(2 ** attempt)
         
         logger.error(f"Failed {method} after {self.max_retries} retries")
+        self._provider_metrics["failed_calls"] += 1
         return None
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Return measured provider and governor health for runtime reporting."""
+        latencies = sorted(self._provider_metrics["latencies_ms"])
+        average_latency_ms = sum(latencies) / len(latencies) if latencies else None
+        p95_latency_ms = (
+            latencies[min(len(latencies) - 1, int(0.95 * len(latencies)))]
+            if latencies else None
+        )
+        governor = self.governor.get_state()
+        elapsed = max(time.time() - self._provider_metrics_started_at, 0.001)
+        request_buckets: Dict[int, int] = {}
+        for timestamp in self._provider_metrics["request_times"]:
+            bucket = int(timestamp)
+            request_buckets[bucket] = request_buckets.get(bucket, 0) + 1
+        return {
+            "requests": self._provider_metrics["requests"],
+            "successful_requests": self._provider_metrics["successful_requests"],
+            "http_429": self._provider_metrics["http_429"],
+            "timeouts": self._provider_metrics["timeouts"],
+            "retries": self._provider_metrics["retries"],
+            "governor_skips": self._provider_metrics["governor_skips"],
+            "failed_calls": self._provider_metrics["failed_calls"],
+            "average_latency_ms": round(average_latency_ms, 2) if average_latency_ms is not None else None,
+            "p95_latency_ms": round(p95_latency_ms, 2) if p95_latency_ms is not None else None,
+            "average_requests_per_second": round(
+                self._provider_metrics["requests"] / elapsed,
+                4,
+            ),
+            "peak_requests_per_second": max(request_buckets.values(), default=0),
+            "credits_used": governor["credits_used"],
+            "governor_state": governor["state"],
+            "governor": governor,
+        }
     
     # --- Token Metadata ---
     
@@ -355,10 +414,19 @@ class HeliusClient:
         result = await self._rpc_call("getAccountInfo", [mint, {"encoding": "jsonParsed"}])
         if result and "value" in result and result["value"]:
             parsed = result["value"]["data"]["parsed"]["info"]
+            try:
+                supply = int(parsed["supply"])
+                decimals = int(parsed["decimals"])
+            except (KeyError, TypeError, ValueError):
+                logger.warning("Mint account is missing valid supply/decimals for %s", mint)
+                return None
+            if supply < 0 or isinstance(parsed.get("decimals"), bool) or not 0 <= decimals <= 18:
+                logger.warning("Mint account has invalid supply/decimals for %s", mint)
+                return None
             info = {
                 "mint": mint,
-                "supply": int(parsed.get("supply", 0)),
-                "decimals": parsed.get("decimals", 0),
+                "supply": supply,
+                "decimals": decimals,
                 "mint_authority": parsed.get("mintAuthority"),
                 "freeze_authority": parsed.get("freezeAuthority"),
                 "is_initialized": parsed.get("isInitialized", True),
@@ -714,140 +782,162 @@ class HeliusClient:
         Uses authoritative mint supply from token_info, not sum of sampled accounts.
         Classifies protocol-controlled bonding-curve accounts separately.
         """
-        if not largest_accounts:
-            return {}
-        
-        # Get authoritative mint supply from token_info (IMMUTABLE cache)
         mint_supply = None
         if token_info and token_info.get("supply") is not None:
             try:
                 mint_supply = int(token_info["supply"])
-            except (ValueError, TypeError):
-                mint_supply = None
-        
-        # Handle amount field which might be string from RPC
-        amounts = []
-        account_data = []  # Track (address, amount) for protocol classification
-        for acc in largest_accounts:
-            amount = acc.get("amount", 0)
-            if isinstance(amount, str):
-                try:
-                    amount = int(amount)
-                except ValueError:
-                    amount = 0
-            amounts.append(amount)
+            except (TypeError, ValueError):
+                pass
+        if mint_supply is not None and mint_supply <= 0:
+            mint_supply = None
+
+        account_data = []
+        invalid_account_count = 0
+        for account in largest_accounts or []:
+            raw_amount = account.get("amount")
+            try:
+                if isinstance(raw_amount, bool) or raw_amount is None:
+                    raise ValueError
+                amount = int(raw_amount)
+                if amount < 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                amount = None
+                invalid_account_count += 1
             account_data.append({
-                "address": acc.get("address"),
+                "address": account.get("address"),
                 "amount": amount,
-                "ui_amount": acc.get("uiAmount"),
+                "owner": None,
+                "classification": "unknown",
+                "reason": "owner_not_resolved",
             })
-            
-        if not amounts or all(a == 0 for a in amounts):
-            return {}
-        
-        amounts.sort(reverse=True)
-        
-        # Protocol account classification
-        protocol_balances = []
-        non_protocol_balances = []
-        unclassified_count = 0
-        protocol_addresses = []
-        
-        if bonding_curve_key and mint_supply is not None and mint_supply > 0:
-            # Fetch token account owners for verification
-            token_account_addresses = [a["address"] for a in account_data if a["address"]]
-            if token_account_addresses:
-                # Batch fetch token account info to get parsed owners
-                accounts_info = await self.get_multiple_accounts(token_account_addresses)
-                for i, info in enumerate(accounts_info):
-                    if i >= len(account_data):
-                        break
-                    amount = account_data[i]["amount"]
-                    if info and info.get("value") and info["value"].get("data", {}).get("parsed"):
-                        try:
-                            parsed_owner = info["value"]["data"]["parsed"]["info"]["owner"]
-                            if parsed_owner == bonding_curve_key:
-                                protocol_balances.append(amount)
-                                protocol_addresses.append(account_data[i]["address"])
-                            else:
-                                non_protocol_balances.append(amount)
-                        except (KeyError, TypeError):
-                            unclassified_count += 1
-                            non_protocol_balances.append(amount)
-                    else:
-                        unclassified_count += 1
-                        non_protocol_balances.append(amount)
-            else:
-                non_protocol_balances = amounts[:]
-        else:
-            # No bonding curve key or no mint supply - all non-protocol
-            non_protocol_balances = amounts[:]
-        
-        protocol_total = sum(protocol_balances)
-        non_protocol_total = sum(non_protocol_balances)
-        total_sampled = sum(amounts)
-        
-        # Calculate concentrations against authoritative mint supply
-        top_1_all = None
-        top_5_all = None
-        top_10_all = None
-        top_1_non_protocol = None
-        top_5_non_protocol = None
-        top_10_non_protocol = None
-        
+
+        valid_amounts = [entry["amount"] for entry in account_data if entry["amount"] is not None]
+        total_sampled = sum(valid_amounts) if valid_amounts else None
         missing_data_reason = None
-        
-        if mint_supply is not None and mint_supply > 0:
-            # All-account concentrations (including protocol)
-            top_1_all = round(amounts[0] / mint_supply * 100, 2) if amounts else 0.0
-            top_5_all = round(sum(amounts[:5]) / mint_supply * 100, 2)
-            top_10_all = round(sum(amounts[:10]) / mint_supply * 100, 2)
-            
-            # Non-protocol concentrations (excluding bonding-curve vault)
-            if non_protocol_total > 0:
-                non_protocol_amounts = sorted(non_protocol_balances, reverse=True)
-                top_1_non_protocol = round(non_protocol_amounts[0] / mint_supply * 100, 2) if non_protocol_amounts else 0.0
-                top_5_non_protocol = round(sum(non_protocol_amounts[:5]) / mint_supply * 100, 2)
-                top_10_non_protocol = round(sum(non_protocol_amounts[:10]) / mint_supply * 100, 2)
-            else:
-                top_1_non_protocol = 0.0
-                top_5_non_protocol = 0.0
-                top_10_non_protocol = 0.0
-        else:
+        if not account_data:
+            missing_data_reason = "largest_accounts_unavailable"
+        elif invalid_account_count:
+            missing_data_reason = "invalid_account_amount"
+        elif mint_supply is None:
             missing_data_reason = "mint_supply_unavailable"
-        
-        result = {
-            "total_holders_in_sample": len(largest_accounts),
+
+        # get_multiple_accounts() returns result["value"], so each item here is
+        # already the account-value object. There is no additional "value" wrapper.
+        if bonding_curve_key and account_data:
+            addressed = [entry for entry in account_data if entry["address"]]
+            account_infos = await self.get_multiple_accounts(
+                [entry["address"] for entry in addressed]
+            ) or []
+            for entry, info in zip(addressed, account_infos):
+                data = info.get("data") if isinstance(info, dict) else None
+                parsed = data.get("parsed") if isinstance(data, dict) else None
+                parsed_info = parsed.get("info") if isinstance(parsed, dict) else None
+                owner = parsed_info.get("owner") if isinstance(parsed_info, dict) else None
+                if owner:
+                    entry["owner"] = owner
+                    if owner == bonding_curve_key:
+                        entry["classification"] = "protocol"
+                        entry["reason"] = "owner_matches_bonding_curve"
+                    else:
+                        entry["classification"] = "non_protocol"
+                        entry["reason"] = "owner_differs_from_bonding_curve"
+            for entry in account_data:
+                if not entry["address"]:
+                    entry["reason"] = "token_account_address_missing"
+        elif account_data:
+            for entry in account_data:
+                entry["reason"] = "bonding_curve_owner_context_unavailable"
+
+        protocol_entries = [
+            entry for entry in account_data
+            if entry["classification"] == "protocol" and entry["amount"] is not None
+        ]
+        non_protocol_entries = [
+            entry for entry in account_data
+            if entry["classification"] == "non_protocol" and entry["amount"] is not None
+        ]
+        unclassified_count = sum(
+            1 for entry in account_data if entry["classification"] == "unknown"
+        )
+        classification_complete = bool(account_data) and unclassified_count == 0
+        protocol_total = sum(entry["amount"] for entry in protocol_entries)
+        non_protocol_total = sum(entry["amount"] for entry in non_protocol_entries)
+        protocol_addresses = [entry["address"] for entry in protocol_entries]
+        circulating_supply = (
+            mint_supply - protocol_total
+            if mint_supply is not None and protocol_total <= mint_supply
+            else None
+        )
+
+        def concentration(balances: List[int], count: int, denominator: Optional[int]):
+            if not balances or denominator is None or denominator <= 0:
+                return None
+            return round(sum(sorted(balances, reverse=True)[:count]) / denominator * 100, 2)
+
+        calculations_reliable = not invalid_account_count and mint_supply is not None
+        if calculations_reliable:
+            top_1_all = concentration(valid_amounts, 1, mint_supply)
+            top_5_all = concentration(valid_amounts, 5, mint_supply)
+            top_10_all = concentration(valid_amounts, 10, mint_supply)
+        else:
+            top_1_all = top_5_all = top_10_all = None
+
+        if calculations_reliable and classification_complete:
+            non_protocol_balances = [entry["amount"] for entry in non_protocol_entries]
+            top_1_non_total = concentration(non_protocol_balances, 1, mint_supply)
+            top_5_non_total = concentration(non_protocol_balances, 5, mint_supply)
+            top_10_non_total = concentration(non_protocol_balances, 10, mint_supply)
+            top_1_non_circulating = concentration(non_protocol_balances, 1, circulating_supply)
+            top_5_non_circulating = concentration(non_protocol_balances, 5, circulating_supply)
+            top_10_non_circulating = concentration(non_protocol_balances, 10, circulating_supply)
+        else:
+            top_1_non_total = top_5_non_total = top_10_non_total = None
+            top_1_non_circulating = top_5_non_circulating = top_10_non_circulating = None
+            if missing_data_reason is None and bonding_curve_key:
+                missing_data_reason = "account_owner_unresolved"
+
+        # Legacy fields retain percentage-of-total-supply semantics. When the
+        # protocol classification is complete they exclude verified protocol
+        # inventory; otherwise they use the conservative all-account measure.
+        risk_values = (
+            (top_1_non_total, top_5_non_total, top_10_non_total)
+            if classification_complete
+            else (top_1_all, top_5_all, top_10_all)
+        )
+        return {
+            "total_holders_in_sample": len(account_data),
             "sampled_balance_total": total_sampled,
             "mint_supply": mint_supply,
-            "denominator_source": "token_info.supply" if mint_supply is not None else "missing",
+            "denominator_source": "token_info.supply" if mint_supply is not None else None,
             "calculation_timestamp": time.time(),
             "protocol_controlled_balance": protocol_total,
             "protocol_accounts": protocol_addresses,
-            "unclassified_account_count": unclassified_count,
             "non_protocol_balance_total": non_protocol_total,
+            "circulating_supply": circulating_supply,
+            "holder_classification_complete": classification_complete,
+            "unclassified_account_count": unclassified_count,
+            "invalid_account_count": invalid_account_count,
+            "account_classifications": account_data,
             "top_1_all_accounts_pct": top_1_all,
             "top_5_all_accounts_pct": top_5_all,
             "top_10_all_accounts_pct": top_10_all,
-            "top_1_non_protocol_pct": top_1_non_protocol,
-            "top_5_non_protocol_pct": top_5_non_protocol,
-            "top_10_non_protocol_pct": top_10_non_protocol,
+            "top_1_non_protocol_pct_total_supply": top_1_non_total,
+            "top_5_non_protocol_pct_total_supply": top_5_non_total,
+            "top_10_non_protocol_pct_total_supply": top_10_non_total,
+            "top_1_non_protocol_pct_circulating_supply": top_1_non_circulating,
+            "top_5_non_protocol_pct_circulating_supply": top_5_non_circulating,
+            "top_10_non_protocol_pct_circulating_supply": top_10_non_circulating,
+            # Transitional aliases used by existing persistence/reporting code.
+            "top_1_non_protocol_pct": top_1_non_total,
+            "top_5_non_protocol_pct": top_5_non_total,
+            "top_10_non_protocol_pct": top_10_non_total,
+            "top_1_holder_pct": risk_values[0],
+            "top_5_holders_pct": risk_values[1],
+            "top_10_holders_pct": risk_values[2],
+            "total_supply_sampled": total_sampled,
             "missing_data_reason": missing_data_reason,
         }
-        
-        # Backward compatibility - old field names (deprecated, will be removed)
-        if mint_supply is not None and mint_supply > 0:
-            result["top_1_holder_pct"] = top_1_all
-            result["top_5_holders_pct"] = top_5_all
-            result["top_10_holders_pct"] = top_10_all
-            result["total_supply_sampled"] = total_sampled
-        else:
-            result["top_1_holder_pct"] = None
-            result["top_5_holders_pct"] = None
-            result["top_10_holders_pct"] = None
-            result["total_supply_sampled"] = None
-        
-        return result
 
 
 class EnrichmentPipeline:

@@ -139,6 +139,16 @@ class PipelineStats:
     pumpportal_reconnects: int = 0
     pumpportal_disconnects: int = 0
     helius_governor_state: str = "UNKNOWN"
+    helius_requests: int = 0
+    helius_successful_requests: int = 0
+    helius_http_429: int = 0
+    helius_timeouts: int = 0
+    helius_retries: int = 0
+    helius_governor_skips: int = 0
+    helius_average_latency_ms: Optional[float] = None
+    helius_p95_latency_ms: Optional[float] = None
+    helius_average_requests_per_second: float = 0.0
+    helius_peak_requests_per_second: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         elapsed = time.time() - self.start_time
@@ -197,7 +207,17 @@ class PipelineStats:
             "provider_health": {
                 "pumpportal_reconnects": self.pumpportal_reconnects,
                 "pumpportal_disconnects": self.pumpportal_disconnects,
-                "helius_governor_state": "UNKNOWN",
+                "helius_governor_state": self.helius_governor_state,
+                "helius_requests": self.helius_requests,
+                "helius_successful_requests": self.helius_successful_requests,
+                "helius_http_429": self.helius_http_429,
+                "helius_timeouts": self.helius_timeouts,
+                "helius_retries": self.helius_retries,
+                "helius_governor_skips": self.helius_governor_skips,
+                "helius_average_latency_ms": self.helius_average_latency_ms,
+                "helius_p95_latency_ms": self.helius_p95_latency_ms,
+                "helius_average_requests_per_second": self.helius_average_requests_per_second,
+                "helius_peak_requests_per_second": self.helius_peak_requests_per_second,
             }
         }
 
@@ -432,6 +452,7 @@ class Phase4BPipeline:
 
     async def _process_discovery_queue(self) -> None:
         """Process new discovery events from queue."""
+        self._sync_runtime_stats()
         if not self.discovery_queue:
             return
 
@@ -496,6 +517,37 @@ class Phase4BPipeline:
 
         for candidate in changed_candidates.values():
             await self._persist_candidate(candidate)
+
+        self._sync_runtime_stats()
+
+    def _sync_runtime_stats(self) -> None:
+        """Copy authoritative component counters into the public pipeline report."""
+        if self.discovery_manager:
+            discovery = self.discovery_manager.get_stats()
+            totals = discovery.get("totals", {})
+            self.stats.raw_events = totals.get("valid_discovery_events", 0)
+            self.stats.unique_mints = totals.get("unique_mints", 0)
+            self.stats.duplicate_count = totals.get("duplicate_count", 0)
+            self.stats.discovery_events_persisted = totals.get("discovery_events_persisted", 0)
+            pumpportal = discovery.get("pumpportal", {})
+            self.stats.pumpportal_reconnects = pumpportal.get("reconnect_count", 0)
+            self.stats.pumpportal_disconnects = pumpportal.get("disconnect_count", 0)
+
+        if self.helius_client and hasattr(self.helius_client, "get_metrics"):
+            helius = self.helius_client.get_metrics()
+            self.stats.helius_requests = helius["requests"]
+            self.stats.helius_successful_requests = helius["successful_requests"]
+            self.stats.helius_http_429 = helius["http_429"]
+            self.stats.helius_timeouts = helius["timeouts"]
+            self.stats.helius_retries = helius["retries"]
+            self.stats.helius_governor_skips = helius["governor_skips"]
+            self.stats.helius_average_latency_ms = helius["average_latency_ms"]
+            self.stats.helius_p95_latency_ms = helius["p95_latency_ms"]
+            self.stats.helius_average_requests_per_second = helius["average_requests_per_second"]
+            self.stats.helius_peak_requests_per_second = helius["peak_requests_per_second"]
+            self.stats.helius_governor_state = helius["governor_state"]
+            self.stats.helius_credits_used = helius["credits_used"]
+            self.stats.rpc_failures = helius["failed_calls"]
 
     async def _process_pre_scoring(self) -> None:
         """Process pre-scoring of new candidates."""
@@ -585,6 +637,7 @@ class Phase4BPipeline:
 
             # Persist risk score
             await self._persist_risk_score(candidate)
+            await self._persist_candidate(candidate)
 
     async def _process_narrative_analysis(self, narrative_engine: NarrativeEngine) -> None:
         """Analyze narrative for enriched candidates."""
@@ -604,9 +657,10 @@ class Phase4BPipeline:
                 enrichment_data=enrichment_data,
             )
             
+            narrative_missing = bool(narrative_signal.get("missing_data", True))
             candidate.narrative_category = narrative_signal.get("category", "unknown")
-            candidate.narrative_score = narrative_signal.get("score", 0.0)
-            candidate.narrative_confidence = narrative_signal.get("confidence", 0.0)
+            candidate.narrative_score = None if narrative_missing else narrative_signal.get("score")
+            candidate.narrative_confidence = None if narrative_missing else narrative_signal.get("confidence")
             candidate.narrative_reasons = narrative_signal.get("reasons", [])
             candidate.narrative_sources_observed = narrative_signal.get("sources_observed", 0)
             candidate.narrative_unique_sources = narrative_signal.get("unique_sources", 0)
@@ -620,6 +674,7 @@ class Phase4BPipeline:
             
             # Persist narrative
             await self._persist_narrative(candidate, narrative_signal)
+            await self._persist_candidate(candidate)
 
     async def _process_meta_decisions(self) -> None:
         """Make meta-scoring decisions for risk-passed candidates."""
@@ -629,7 +684,9 @@ class Phase4BPipeline:
         # Get candidates that passed risk and are ready for meta decision
         ready = [c for c in self.discovery_queue.get_all()
                 if c.enrichment_status == "completed"
+                and c.risk_evaluated
                 and c.risk_class != "REJECT"
+                and c.narrative_evaluated
                 and not c.meta_evaluated]
 
         for candidate in ready:
@@ -638,53 +695,55 @@ class Phase4BPipeline:
             
             # On-Chain Quality - derived from enrichment
             onchain_quality = 0.0
+            completeness = 0.0
             if hasattr(candidate, 'enrichment_data') and candidate.enrichment_data:
                 enrichment = candidate.enrichment_data
                 # Check enrichment completeness
-                completeness = 0.0
-                if enrichment.get("token_info"):
+                if enrichment.get("token_info") is not None:
                     completeness += 0.3
-                if enrichment.get("largest_accounts"):
+                if enrichment.get("largest_accounts") is not None:
                     completeness += 0.2
-                if enrichment.get("holder_analysis"):
+                if enrichment.get("holder_analysis") is not None:
                     completeness += 0.2
-                if enrichment.get("creator_signatures"):
+                if enrichment.get("creator_signatures") is not None:
                     completeness += 0.15
-                if enrichment.get("creator_accounts"):
+                if enrichment.get("creator_accounts") is not None:
                     completeness += 0.15
                 onchain_quality = completeness * 100
             
-            # Liquidity / Execution - from actual data
-            liquidity_execution = 0.0
-            if hasattr(candidate, 'enrichment_data') and candidate.enrichment_data:
-                enrichment = candidate.enrichment_data
-                if enrichment.get("holder_analysis"):
-                    ha = enrichment["holder_analysis"]
-                    top_10 = ha.get("top_10_holders_pct", 100)
-                    liquidity_execution = max(0, 100 - top_10)  # Less concentration = better liquidity
-            
+            # Liquidity / Execution - derived from the actual sell quote. Holder
+            # concentration belongs to Risk and is not a liquidity proxy.
+            liquidity_execution = None
+
             # Narrative / Momentum - from narrative engine
-            narrative_momentum = 0.0
+            narrative_momentum = None
             narrative_confidence = 0.0
-            if hasattr(candidate, 'narrative_score') and candidate.narrative_score is not None:
+            if (
+                not getattr(candidate, "narrative_missing_data", True)
+                and hasattr(candidate, 'narrative_score')
+                and candidate.narrative_score is not None
+            ):
                 narrative_momentum = candidate.narrative_score
-            if hasattr(candidate, 'narrative_confidence') and candidate.narrative_confidence is not None:
+            if narrative_momentum is not None and candidate.narrative_confidence is not None:
                 narrative_confidence = candidate.narrative_confidence
             
-            # Creator Quality - from enrichment
-            creator_quality = candidate.pre_score * 100
-            if hasattr(candidate, 'enrichment_data') and candidate.enrichment_data:
-                enrichment = candidate.enrichment_data
-                if enrichment.get("creator_signatures") and enrichment.get("creator_accounts"):
-                    creator_quality = min(creator_quality * 1.2, 100)
+            # Creator Quality remains missing unless creator evidence was actually
+            # collected. It must not inherit the unrelated discovery score.
+            creator_quality = None
+            creator_confidence = 0.0
             
             risk_score = int(candidate.risk_score)
             risk_class = candidate.risk_class
             
             sell_quote = candidate.enrichment_data.get("sell_quote", {})
-            price_impact = abs(float(sell_quote.get("price_impact_pct", 1.0)))
-            quote_age = max(0.0, time.time() - float(sell_quote.get("timestamp", 0.0)))
-            quote_quality = max(0.0, 1.0 - min(price_impact, 1.0)) if quote_age <= 30 else 0.0
+            price_impact_pct = abs(float(sell_quote["price_impact_pct"]))
+            quote_age = max(0.0, time.time() - float(sell_quote["timestamp"]))
+            quote_quality = (
+                max(0.0, 1.0 - min(price_impact_pct / 100.0, 1.0))
+                if quote_age <= 30 else 0.0
+            )
+            liquidity_execution = quote_quality * 100.0
+            slippage_estimate = price_impact_pct / 100.0
 
             meta_result = self.meta_engine.evaluate(
                 discovery_quality=discovery_quality,
@@ -695,9 +754,11 @@ class Phase4BPipeline:
                 risk_score=risk_score,
                 risk_class=risk_class,
                 narrative_confidence=narrative_confidence,
-                enrichment_completeness=1.0 if candidate.enrichment_status == "completed" else 0.0,
+                enrichment_completeness=completeness,
                 quote_quality=quote_quality,
-                slippage_estimate=price_impact,
+                slippage_estimate=slippage_estimate,
+                creator_confidence=creator_confidence,
+                risk_confidence=getattr(candidate, "risk_confidence", 0.0),
             )
 
             candidate.meta_score = meta_result["meta_score"]
@@ -708,6 +769,11 @@ class Phase4BPipeline:
             candidate.meta_component_breakdown = meta_result.get("component_breakdown", {})
             candidate.recommended_size_sol = meta_result.get("recommended_size_sol", 0.02)
             candidate.calibration = meta_result.get("calibration", "EMPIRICAL_UNCALIBRATED")
+            candidate.expected_return_estimate = meta_result.get("expected_return")
+            candidate.expected_downside = meta_result.get("expected_downside")
+            candidate.estimated_execution_cost = meta_result.get("estimated_execution_cost")
+            candidate.estimated_slippage = meta_result.get("estimated_slippage")
+            candidate.risk_adjusted_ev = meta_result.get("risk_adjusted_ev")
 
             if meta_result["decision"] == "approve":
                 candidate.meta_approved = True
@@ -717,6 +783,7 @@ class Phase4BPipeline:
                 self.stats.meta_rejected += 1
 
             await self._persist_meta_decision(candidate)
+            await self._persist_candidate(candidate)
 
     async def _process_paper_entries(self) -> None:
         """Enter paper positions for meta-approved candidates."""
@@ -766,6 +833,7 @@ class Phase4BPipeline:
 
                 # Persist entry with actual execution values
                 await self._persist_paper_entry(candidate, intent, True, result)
+                await self._persist_candidate(candidate)
             else:
                 self.stats.provider_failures += 1
                 logger.warning(f"Entry failed for {candidate.mint}: {result.error}")
@@ -812,9 +880,9 @@ class Phase4BPipeline:
                 if quote:
                     market_data[mint] = {
                         "price": quote.executable_price,
-                        "liquidity_usd": 0,  # Would come from enrichment
-                        "market_cap_usd": 0,
-                        "volume_24h_usd": 0,
+                        "liquidity_usd": None,
+                        "market_cap_usd": None,
+                        "volume_24h_usd": None,
                     }
             except Exception as e:
                 logger.warning(f"Failed to fetch market data for {mint}: {e}")
@@ -842,26 +910,58 @@ class Phase4BPipeline:
         now = time.time()
 
         for candidate in all_candidates:
-            # Schedule outcome observations at various horizons
+            if not getattr(candidate, "_outcome_sampling_scheduled", False):
+                candidate._outcome_sampling_scheduled = True
+                self.stats.outcomes_scheduled += 1
+
+            if not hasattr(candidate, "_outcomes_recorded"):
+                candidate._outcomes_recorded = set()
+
+            # Schedule outcome observations at various horizons.
             horizons = [60, 300, 900, 1800, 3600, 14400, 86400]  # seconds
 
             for horizon in horizons:
-                # Check if it's time to record this horizon
-                if candidate.first_discovered + horizon <= now:
-                    # Check if we've already recorded this horizon for this candidate
-                    # We'll track with a simple set on the candidate
-                    if not hasattr(candidate, '_outcomes_recorded'):
-                        candidate._outcomes_recorded = set()
-                    
-                    if horizon not in candidate._outcomes_recorded:
-                        # Record outcome snapshot
-                        if await self._record_outcome_snapshot(candidate, horizon, now):
-                            candidate._outcomes_recorded.add(horizon)
-                            self.stats.outcomes_completed += 1
+                if candidate.first_discovered + horizon > now:
+                    continue
+                if horizon in candidate._outcomes_recorded:
+                    continue
 
-    async def _record_outcome_snapshot(self, candidate: Candidate, horizon: int, now: float) -> bool:
-        """Record an outcome snapshot for a candidate at a specific horizon."""
+                self.stats.snapshots_due += 1
+                status, price_missing = await self._record_outcome_snapshot(candidate, horizon, now)
+                if status == "inserted":
+                    candidate._outcomes_recorded.add(horizon)
+                    self.stats.snapshots_inserted += 1
+                    self.stats.outcomes_completed += 1
+                    if price_missing:
+                        self.stats.missing_price_observations += 1
+                elif status == "already_exists":
+                    candidate._outcomes_recorded.add(horizon)
+                    self.stats.duplicate_snapshots_skipped += 1
+                else:
+                    self.stats.observation_errors += 1
+
+    async def _record_outcome_snapshot(
+        self,
+        candidate: Candidate,
+        horizon: int,
+        now: float,
+    ) -> tuple[str, bool]:
+        """Record a snapshot and return (status, price_missing)."""
+        import sqlite3
+
+        conn = None
         try:
+            # Check idempotency before making provider calls.
+            conn = sqlite3.connect(str(self.db_path))
+            existing = conn.execute(
+                "SELECT 1 FROM outcome_snapshots WHERE candidate_mint = ? AND horizon_seconds = ? LIMIT 1",
+                (candidate.mint, horizon),
+            ).fetchone()
+            if existing:
+                return "already_exists", False
+            conn.close()
+            conn = None
+
             # Get current price quote
             quote = await self.helius_client.get_price(candidate.mint, side="sell", size_sol=0.02)
             
@@ -879,23 +979,14 @@ class Phase4BPipeline:
             sell_quote_available = None
             try:
                 sell_quote = await self.helius_client.get_sell_quote(candidate.mint, 1000.0, slippage_bps=50)
-                if sell_quote:
-                    sell_quote_available = True
+                sell_quote_available = bool(sell_quote)
             except Exception as exc:
                 logger.debug("Sellability observation unavailable for %s: %s", candidate.mint, exc)
             
             # Persist to database
-            import sqlite3
             conn = sqlite3.connect(str(self.db_path))
-            existing = conn.execute(
-                "SELECT 1 FROM outcome_snapshots WHERE candidate_mint = ? AND horizon_seconds = ? LIMIT 1",
-                (candidate.mint, horizon),
-            ).fetchone()
-            if existing:
-                conn.close()
-                return True
-            conn.execute("""
-                INSERT INTO outcome_snapshots
+            cursor = conn.execute("""
+                INSERT OR IGNORE INTO outcome_snapshots
                 (candidate_mint, horizon_seconds, observation_time, price_sol,
                  executable_buy_price, executable_sell_price, liquidity_usd,
                  price_change_from_decision, max_favorable_excursion, max_adverse_excursion,
@@ -931,13 +1022,17 @@ class Phase4BPipeline:
                 now,  # created_at
             ))
             conn.commit()
-            conn.close()
-            return True
+            if cursor.rowcount == 0:
+                return "already_exists", False
+            return "inserted", price_sol is None
             
         except Exception as e:
             logger.error(f"Failed to record outcome snapshot for {candidate.mint} at {horizon}s: {e}")
             self.stats.database_errors += 1
-            return False
+            return "failed", True
+        finally:
+            if conn is not None:
+                conn.close()
 
     async def _metrics_loop(self) -> None:
         """Periodic metrics logging."""
@@ -952,11 +1047,13 @@ class Phase4BPipeline:
 
     def _log_metrics(self) -> None:
         """Log current pipeline metrics."""
+        self._sync_runtime_stats()
         stats = self.stats.to_dict()
         logger.info(f"Pipeline Metrics: {json.dumps(stats, indent=2)}")
 
     def _print_final_stats(self) -> None:
         """Print final statistics at shutdown."""
+        self._sync_runtime_stats()
         stats = self.stats.to_dict()
         stats["runtime_seconds"] = time.time() - self._start_time
         print("\n" + "="*60)
@@ -978,6 +1075,19 @@ class Phase4BPipeline:
         try:
             import sqlite3
             conn = sqlite3.connect(str(self.db_path))
+            risk_score = candidate.risk_score if candidate.risk_evaluated else None
+            risk_class = candidate.risk_class if candidate.risk_evaluated else None
+            risk_reasons = json.dumps(candidate.risk_reasons) if candidate.risk_evaluated else None
+            narrative_score = candidate.narrative_score if candidate.narrative_evaluated else None
+            narrative_category = candidate.narrative_category if candidate.narrative_evaluated else None
+            narrative_confidence = candidate.narrative_confidence if candidate.narrative_evaluated else None
+            meta_score = candidate.meta_score if candidate.meta_evaluated else None
+            meta_confidence = candidate.meta_confidence if candidate.meta_evaluated else None
+            meta_approved = int(candidate.meta_approved) if candidate.meta_evaluated else None
+            rejection_reason = (
+                getattr(candidate, "meta_rejection_reason", None)
+                if candidate.meta_evaluated else None
+            )
             conn.execute("""
                 INSERT OR REPLACE INTO candidates
                 (mint, symbol, name, first_discovered, discovery_source,
@@ -998,12 +1108,9 @@ class Phase4BPipeline:
                 candidate.pre_score_timestamp,
                 candidate.enrichment_status, candidate.enrichment_attempts,
                 candidate.last_enrichment,
-                candidate.risk_score, candidate.risk_class,
-                json.dumps(candidate.risk_reasons),
-                candidate.narrative_score, candidate.narrative_category,
-                candidate.narrative_confidence,
-                candidate.meta_score, candidate.meta_confidence,
-                int(candidate.meta_approved), candidate.rejection_reason,
+                risk_score, risk_class, risk_reasons,
+                narrative_score, narrative_category, narrative_confidence,
+                meta_score, meta_confidence, meta_approved, rejection_reason,
                 int(candidate.paper_entered), candidate.paper_entry_time,
                 time.time()
             ))
@@ -1047,6 +1154,7 @@ class Phase4BPipeline:
         try:
             import sqlite3
             conn = sqlite3.connect(str(self.db_path))
+            missing = bool(narrative_signal.get("missing_data", True))
             conn.execute("""
                 INSERT INTO narratives
                 (mint, candidate_id, snapshot_at, narrative_category, narrative_strength,
@@ -1057,16 +1165,16 @@ class Phase4BPipeline:
             """, (
                 candidate.mint, None, time.time(),
                 narrative_signal.get("category", "unknown"),
-                narrative_signal.get("score", 0.0),
-                narrative_signal.get("mentions_delta", 0.0),
-                narrative_signal.get("sources_observed", 0),
-                narrative_signal.get("unique_sources", 0),
-                0,  # duplicate_narrative_count
+                None if missing else narrative_signal.get("score"),
+                None if missing else narrative_signal.get("mentions_delta"),
+                None if missing else narrative_signal.get("sources_observed"),
+                None if missing else narrative_signal.get("unique_sources"),
+                None,  # duplicate_narrative_count was not measured
                 None,  # trend_alignment
-                0.0,  # pop_culture_relevance
-                1.0 if not narrative_signal.get("missing_data", True) else 0.5,
-                narrative_signal.get("unique_sources", 0),
-                narrative_signal.get("confidence", 0.0),
+                None,  # pop_culture_relevance was not measured
+                None,  # metadata_quality was not measured
+                None if missing else narrative_signal.get("unique_sources"),
+                None if missing else narrative_signal.get("confidence"),
                 json.dumps({
                     "reasons": narrative_signal.get("reasons", []),
                     "mentions_total": narrative_signal.get("mentions_total", 0),
@@ -1088,8 +1196,8 @@ class Phase4BPipeline:
             conn = sqlite3.connect(str(self.db_path))
             
             # Extract actual values from risk assessment
-            mint_authority_active = 0
-            freeze_authority_active = 0
+            mint_authority_active = None
+            freeze_authority_active = None
             creator_holdings_pct = None
             top_1_holder_pct = None
             top_10_holders_pct = None
@@ -1097,7 +1205,7 @@ class Phase4BPipeline:
             current_liquidity_sol = None
             liquidity_change_pct = None
             creator_rapid_launches = None
-            metadata_abnormalities = "[]"
+            metadata_abnormalities = None
             
             if hasattr(candidate, 'risk_component_scores') and candidate.risk_component_scores:
                 # Extract from component scores
@@ -1112,8 +1220,12 @@ class Phase4BPipeline:
                     freeze_authority_active = 1 if token_info.get("freeze_authority") else 0
                 if enrichment.get("holder_analysis"):
                     ha = enrichment["holder_analysis"]
-                    top_1_holder_pct = ha.get("top_1_holder_pct")
-                    top_10_holders_pct = ha.get("top_10_holders_pct")
+                    if ha.get("holder_classification_complete") is True:
+                        top_1_holder_pct = ha.get("top_1_non_protocol_pct_total_supply")
+                        top_10_holders_pct = ha.get("top_10_non_protocol_pct_total_supply")
+                    else:
+                        top_1_holder_pct = ha.get("top_1_all_accounts_pct")
+                        top_10_holders_pct = ha.get("top_10_all_accounts_pct")
             
             conn = sqlite3.connect(str(self.db_path))
             conn.execute("""
@@ -1179,8 +1291,8 @@ class Phase4BPipeline:
                 estimated_execution_cost, estimated_slippage, risk_adjusted_ev,
                 candidate.recommended_size_sol if hasattr(candidate, 'recommended_size_sol') else None,
                 "approve" if candidate.meta_approved else "reject",
-                candidate.rejection_reason if hasattr(candidate, 'rejection_reason') else "",
-                "approve" if candidate.meta_approved else "reject",
+                candidate.meta_rejection_reason if hasattr(candidate, 'meta_rejection_reason') else None,
+                candidate.meta_decision if hasattr(candidate, 'meta_decision') else None,
                 json.dumps(candidate.meta_component_breakdown if hasattr(candidate, 'meta_component_breakdown') else {}),
                 time.time()
             ))
@@ -1192,25 +1304,20 @@ class Phase4BPipeline:
 
     async def _persist_paper_entry(self, candidate: Candidate, intent: EntryIntent, success: bool, result: Optional[FillResult] = None) -> None:
         """Persist paper entry attempt with actual execution values."""
+        if not success or result is None or not result.success:
+            # The schema models positions and fills, not failed attempts. Writing
+            # an all-zero REJECTED position fabricates a fill that never happened.
+            return
         try:
             import sqlite3
             conn = sqlite3.connect(str(self.db_path))
             
-            # Use actual execution data if available, otherwise fall back to intent
-            if result and result.success:
-                entry_price = result.fill_price_sol
-                initial_tokens = float(result.tokens_received)
-                entry_cost_basis = result.total_cost_basis_sol
-                entry_fees = result.priority_fee_sol
-                size_sol = result.sol_spent
-                entry_time = candidate.paper_entry_time or time.time()
-            else:
-                entry_price = 0.0
-                initial_tokens = 0.0
-                entry_cost_basis = 0.0
-                entry_fees = 0.0
-                size_sol = intent.size_sol
-                entry_time = time.time()
+            entry_price = result.fill_price_sol
+            initial_tokens = float(result.tokens_received)
+            entry_cost_basis = result.total_cost_basis_sol
+            entry_fees = result.priority_fee_sol
+            size_sol = result.sol_spent
+            entry_time = candidate.paper_entry_time or time.time()
             
             cursor = conn.execute("""
                 INSERT INTO paper_positions
@@ -1221,10 +1328,9 @@ class Phase4BPipeline:
                 candidate.mint, candidate.symbol, None,
                 entry_price, entry_time, size_sol,
                 initial_tokens, initial_tokens, entry_cost_basis, entry_fees,
-                "OPEN" if success else "REJECTED"
+                "OPEN"
             ))
-            if result and result.success:
-                conn.execute("""
+            conn.execute("""
                     INSERT INTO paper_fills
                     (position_id, mint, side, fill_time, tokens_filled, avg_price,
                      gross_proceeds_sol, network_costs_sol, net_proceeds_sol,
@@ -1233,18 +1339,18 @@ class Phase4BPipeline:
                      quote_swap_fee_bps, quote_platform_fee_bps, priority_fee_sol,
                      tokens_remaining, realized_pnl_cumulative)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    cursor.lastrowid, candidate.mint, result.side, entry_time,
-                    float(result.tokens_filled), result.avg_price,
-                    float(result.gross_proceeds), float(result.network_costs),
-                    float(result.net_proceeds), float(result.realized_pnl),
-                    result.quote_timestamp,
-                    max(0.0, entry_time - result.quote_timestamp),
-                    result.price_impact_pct, result.slippage_bps,
-                    result.route_provider, result.swap_fee_bps,
-                    result.platform_fee_bps, result.priority_fee_sol,
-                    float(result.tokens_filled), float(result.realized_pnl),
-                ))
+            """, (
+                cursor.lastrowid, candidate.mint, result.side, entry_time,
+                float(result.tokens_filled), result.avg_price,
+                float(result.gross_proceeds), float(result.network_costs),
+                float(result.net_proceeds), float(result.realized_pnl),
+                result.quote_timestamp,
+                max(0.0, entry_time - result.quote_timestamp),
+                result.price_impact_pct, result.slippage_bps,
+                result.route_provider, result.swap_fee_bps,
+                result.platform_fee_bps, result.priority_fee_sol,
+                float(result.tokens_filled), float(result.realized_pnl),
+            ))
             conn.commit()
             conn.close()
         except Exception as e:

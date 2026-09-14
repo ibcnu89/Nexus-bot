@@ -91,8 +91,8 @@ class MetaEngine:
         discovery_quality: float,
         onchain_quality: float,
         liquidity_execution: float,
-        narrative_momentum: float,
-        creator_quality: float,
+        narrative_momentum: Optional[float],
+        creator_quality: Optional[float],
         risk_score: int,
         risk_class: str,
         narrative_confidence: float = 0.5,
@@ -100,6 +100,8 @@ class MetaEngine:
         quote_quality: float = 0.5,
         slippage_estimate: float = 0.02,
         priority_fee_sol: float = 0.0005,
+        creator_confidence: float = 0.0,
+        risk_confidence: float = 1.0,
     ) -> Dict[str, Any]:
         """
         Evaluate all signals into a meta decision.
@@ -126,12 +128,16 @@ class MetaEngine:
             ("discovery_quality", discovery_quality),
             ("onchain_quality", onchain_quality),
             ("liquidity_execution", liquidity_execution),
-            ("narrative_momentum", narrative_momentum),
-            ("creator_quality", creator_quality),
             ("risk_score", risk_score),
         ]:
             if not 0 <= val <= 100:
                 raise ValueError(f"{name} must be 0-100, got {val}")
+        if narrative_momentum is not None and not 0 <= narrative_momentum <= 100:
+            raise ValueError(
+                f"narrative_momentum must be 0-100 or None, got {narrative_momentum}"
+            )
+        if creator_quality is not None and not 0 <= creator_quality <= 100:
+            raise ValueError(f"creator_quality must be 0-100 or None, got {creator_quality}")
         
         if not 0 <= narrative_confidence <= 1:
             raise ValueError("narrative_confidence must be 0-1")
@@ -139,6 +145,10 @@ class MetaEngine:
             raise ValueError("enrichment_completeness must be 0-1")
         if not 0 <= quote_quality <= 1:
             raise ValueError("quote_quality must be 0-1")
+        if not 0 <= creator_confidence <= 1:
+            raise ValueError("creator_confidence must be 0-1")
+        if not 0 <= risk_confidence <= 1:
+            raise ValueError("risk_confidence must be 0-1")
         
         # Component scores
         components = {}
@@ -150,14 +160,14 @@ class MetaEngine:
         )
         
         # On-Chain Quality (25 pts max)
-        onchain_confidence = 0.5  # Base confidence
+        onchain_confidence = enrichment_completeness
         components["onchain_quality"] = self._make_component(
             "onchain_quality", onchain_quality, 25, onchain_confidence,
             ["enrichment_completeness", "token_quality"]
         )
         
         # Liquidity/Execution (20 pts max)
-        liq_confidence = 0.6 if slippage_estimate < 0.05 else 0.3
+        liq_confidence = quote_quality
         components["liquidity_execution"] = self._make_component(
             "liquidity_execution", liquidity_execution, 20, liq_confidence,
             ["liquidity_depth", "slippage", "quote_quality"]
@@ -167,23 +177,24 @@ class MetaEngine:
         nar_confidence = min(narrative_confidence, 0.8)  # Cap narrative confidence
         components["narrative_momentum"] = self._make_component(
             "narrative_momentum", narrative_momentum, 20, nar_confidence,
-            ["narrative_score", "velocity", "sentiment"]
+            ["narrative_score", "velocity", "sentiment"],
+            missing=narrative_momentum is None,
         )
         
         # Creator Quality (15 pts max)
-        creator_confidence = 0.5  # Hard to verify
         components["creator_quality"] = self._make_component(
             "creator_quality", creator_quality, 15, creator_confidence,
-            ["creator_reputation", "history", "serial_launches"]
+            ["creator_reputation", "history", "serial_launches"],
+            missing=creator_quality is None,
         )
         
         # Risk Penalty (0 to -100)
-        risk_penalty = min(risk_score * 1.5, 100)  # Cap at 100
+        risk_penalty = min(risk_score * self.risk_penalty_weight, 100)
         components["risk_penalty"] = ComponentScore(
             name="risk_penalty",
             score=-risk_penalty,
             max_weight=100,
-            confidence=0.9,
+            confidence=risk_confidence,
             evidence=[f"risk_score={risk_score}", f"risk_class={risk_class}"],
             missing=False,
         )
@@ -220,9 +231,11 @@ class MetaEngine:
         elif risk_score >= 70:
             decision = "reject"
             rejection_reason = f"Risk score {risk_score} >= 70"
-        elif meta_score < 50:
+        elif meta_score < self.min_meta_score_for_entry:
             decision = "reject"
-            rejection_reason = f"Meta score {meta_score:.1f} < 50"
+            rejection_reason = (
+                f"Meta score {meta_score:.1f} < {self.min_meta_score_for_entry:g}"
+            )
         else:
             decision = "approve"
             rejection_reason = ""
@@ -248,22 +261,26 @@ class MetaEngine:
             "risk_adjusted_ev": risk_adjusted_ev,
             "recommended_size_sol": recommended_size_sol,
             "decision": decision,
-            "rejection_reason": "" if decision == "approve" else f"Risk class {risk_class} (score={risk_score})" if risk_class == "REJECT" else f"Meta score {meta_score:.1f} < 50",
+            "rejection_reason": rejection_reason,
             "calibration": "EMPIRICAL_UNCALIBRATED",
-            "component_breakdown": {k: round(v.score, 2) for k, v in components.items()},
+            "component_breakdown": {
+                k: None if v.missing else round(v.score, 2)
+                for k, v in components.items()
+            },
         }
     
     def _make_component(
         self,
         name: str,
-        raw_score: float,
+        raw_score: Optional[float],
         max_weight: float,
         confidence: float,
         evidence: List[str],
+        missing: bool = False,
     ) -> ComponentScore:
         """Create a normalized component score."""
         # Normalize score to weight
-        normalized = max(0.0, min(1.0, raw_score / 100.0))
+        normalized = 0.0 if raw_score is None else max(0.0, min(1.0, raw_score / 100.0))
         score = normalized * max_weight
         
         return ComponentScore(
@@ -272,7 +289,7 @@ class MetaEngine:
             max_weight=max_weight,
             confidence=confidence,
             evidence=evidence,
-            missing=False,
+            missing=missing,
         )
 
 

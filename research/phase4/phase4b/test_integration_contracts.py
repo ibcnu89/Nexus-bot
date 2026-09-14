@@ -435,6 +435,7 @@ def test_unknown_narrative_is_evaluated_once():
         return None
 
     pipeline._persist_narrative = persist
+    pipeline._persist_candidate = persist
     engine = Engine()
 
     async def run_twice():
