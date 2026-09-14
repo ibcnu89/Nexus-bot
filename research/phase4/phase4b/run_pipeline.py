@@ -15,6 +15,7 @@ import os
 import signal
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
@@ -44,6 +45,7 @@ from research.phase4.phase4b.execution.paper_adapter import (
     PaperExecutionAdapter, EntryIntent, ExitIntent, FillResult
 )
 from research.phase4.phase4b.storage.database import SCHEMA_SQL
+from research.phase4.prototype.paper_position_manager import ExitTrigger
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +74,7 @@ class PipelineConfig:
     max_new_positions_per_hour: int = 20
     max_slippage_bps: int = 50
     max_priority_fee_sol: float = 0.0005
+    position_update_interval_seconds: float = 60.0
 
     # Database
     db_path: str = "research/phase4/phase4b/results/phase4b_experiment.db"
@@ -125,6 +128,12 @@ class PipelineStats:
     paper_exits: int = 0
     partial_exits: int = 0
     final_exits: int = 0
+    position_monitor_interval_seconds: float = 60.0
+    position_monitor_cycles: int = 0
+    position_monitor_cycles_skipped_by_cadence: int = 0
+    position_monitor_quote_attempts: int = 0
+    position_monitor_quotes_received: int = 0
+    position_monitor_peak_open_positions: int = 0
 
     # Outcome sampling
     outcomes_scheduled: int = 0
@@ -155,6 +164,15 @@ class PipelineStats:
     helius_p95_latency_ms: Optional[float] = None
     helius_average_requests_per_second: float = 0.0
     helius_peak_requests_per_second: int = 0
+    helius_requests_by_purpose: Dict[str, int] = field(default_factory=dict)
+    helius_successful_requests_by_purpose: Dict[str, int] = field(default_factory=dict)
+    helius_credits_by_purpose: Dict[str, int] = field(default_factory=dict)
+    helius_session_credits_per_second: float = 0.0
+    helius_session_projected_daily_credits: int = 0
+    helius_session_projected_monthly_credits: int = 0
+    helius_projection_ready: bool = False
+    helius_projection_basis: str = "process_session_run_rate_30_days"
+    helius_account_cycle_state: str = "UNKNOWN"
 
     def to_dict(self) -> Dict[str, Any]:
         elapsed = time.time() - self.start_time
@@ -200,6 +218,14 @@ class PipelineStats:
                 "exits": self.paper_exits,
                 "partial_exits": self.partial_exits,
                 "final_exits": self.final_exits,
+                "position_monitor": {
+                    "interval_seconds": self.position_monitor_interval_seconds,
+                    "cycles": self.position_monitor_cycles,
+                    "cycles_skipped_by_cadence": self.position_monitor_cycles_skipped_by_cadence,
+                    "quote_attempts": self.position_monitor_quote_attempts,
+                    "quotes_received": self.position_monitor_quotes_received,
+                    "peak_open_positions": self.position_monitor_peak_open_positions,
+                },
             },
             "outcomes": {
                 "scheduled": self.outcomes_scheduled,
@@ -230,6 +256,17 @@ class PipelineStats:
                 "helius_p95_latency_ms": self.helius_p95_latency_ms,
                 "helius_average_requests_per_second": self.helius_average_requests_per_second,
                 "helius_peak_requests_per_second": self.helius_peak_requests_per_second,
+                "helius_requests_by_purpose": dict(self.helius_requests_by_purpose),
+                "helius_successful_requests_by_purpose": dict(
+                    self.helius_successful_requests_by_purpose
+                ),
+                "helius_credits_by_purpose": dict(self.helius_credits_by_purpose),
+                "helius_session_credits_per_second": self.helius_session_credits_per_second,
+                "helius_session_projected_daily_credits": self.helius_session_projected_daily_credits,
+                "helius_session_projected_monthly_credits": self.helius_session_projected_monthly_credits,
+                "helius_projection_ready": self.helius_projection_ready,
+                "helius_projection_basis": self.helius_projection_basis,
+                "helius_account_cycle_state": self.helius_account_cycle_state,
             }
         }
 
@@ -245,8 +282,10 @@ class Phase4BPipeline:
     def __init__(self, config: PipelineConfig):
         self.config = config
         self.stats = PipelineStats()
+        self.stats.position_monitor_interval_seconds = config.position_update_interval_seconds
         self._running = False
         self._start_time = 0.0
+        self._last_position_update_monotonic: Optional[float] = None
 
         # Setup logging
         logging.basicConfig(
@@ -276,6 +315,11 @@ class Phase4BPipeline:
     def _signal_handler(self, signum, frame):
         logger.info(f"Received signal {signum}, initiating graceful shutdown...")
         self._running = False
+
+    def _helius_request_purpose(self, purpose: str):
+        """Use purpose attribution when the configured client supports it."""
+        tracker = getattr(getattr(self, "helius_client", None), "request_purpose", None)
+        return tracker(purpose) if tracker else nullcontext()
 
     async def initialize(self) -> None:
         """Initialize all pipeline components."""
@@ -557,9 +601,31 @@ class Phase4BPipeline:
             self.stats.helius_p95_latency_ms = helius["p95_latency_ms"]
             self.stats.helius_average_requests_per_second = helius["average_requests_per_second"]
             self.stats.helius_peak_requests_per_second = helius["peak_requests_per_second"]
+            self.stats.helius_requests_by_purpose = helius.get("requests_by_purpose", {})
+            self.stats.helius_successful_requests_by_purpose = helius.get(
+                "successful_requests_by_purpose", {}
+            )
+            self.stats.helius_credits_by_purpose = helius.get("credits_by_purpose", {})
             self.stats.helius_governor_state = helius["governor_state"]
             self.stats.helius_credits_used = helius["credits_used"]
             self.stats.rpc_failures = helius["failed_calls"]
+            governor = helius.get("governor", {})
+            self.stats.helius_session_credits_per_second = governor.get(
+                "session_credits_per_second", 0.0
+            )
+            self.stats.helius_session_projected_daily_credits = governor.get(
+                "session_projected_daily_credits", 0
+            )
+            self.stats.helius_session_projected_monthly_credits = governor.get(
+                "session_projected_monthly_credits", 0
+            )
+            self.stats.helius_projection_ready = governor.get("projection_ready", False)
+            self.stats.helius_projection_basis = governor.get(
+                "projection_basis", "process_session_run_rate_30_days"
+            )
+            self.stats.helius_account_cycle_state = governor.get(
+                "account_cycle_state", "UNKNOWN"
+            )
 
     async def _process_pre_scoring(self) -> None:
         """Process pre-scoring of new candidates."""
@@ -589,7 +655,10 @@ class Phase4BPipeline:
 
         # Enrich batch
         try:
-            enrichment_results = await self.enrichment_pipeline.enrich_batch(candidates_to_enrich)
+            with self._helius_request_purpose("enrichment"):
+                enrichment_results = await self.enrichment_pipeline.enrich_batch(
+                    candidates_to_enrich
+                )
 
             for candidate in candidates_to_enrich:
                 if candidate.mint in enrichment_results:
@@ -831,7 +900,8 @@ class Phase4BPipeline:
 
             # Execute entry
             self.stats.paper_entry_attempts += 1
-            result = await self.paper_adapter.execute_entry(intent)
+            with self._helius_request_purpose("paper_execution"):
+                result = await self.paper_adapter.execute_entry(intent)
 
             if result.success:
                 candidate.paper_entered = True
@@ -857,33 +927,66 @@ class Phase4BPipeline:
                 logger.warning(f"Entry failed for {candidate.mint}: {result.error}")
                 await self._persist_paper_entry(candidate, intent, False, result)
 
-    async def _update_paper_positions(self) -> None:
-        """Update all open paper positions with market data."""
+    async def _update_paper_positions(self, now_monotonic: Optional[float] = None) -> None:
+        """Update open positions no more often than the configured cadence."""
         if not self.paper_adapter:
             return
 
-        # Get market data for all open positions
-        market_data = await self._fetch_market_data()
+        open_positions = len(self.paper_adapter.positions)
+        if open_positions == 0:
+            # A later newly opened position should receive an immediate first
+            # observation instead of inheriting an old position's deadline.
+            self._last_position_update_monotonic = None
+            return
+
+        interval = float(getattr(
+            self.config,
+            "position_update_interval_seconds",
+            self.stats.position_monitor_interval_seconds,
+        ))
+        if interval <= 0:
+            raise ValueError("position_update_interval_seconds must be greater than zero")
+        self.stats.position_monitor_interval_seconds = interval
+
+        now_tick = time.monotonic() if now_monotonic is None else now_monotonic
+        last_tick = getattr(self, "_last_position_update_monotonic", None)
+        if last_tick is not None and now_tick - last_tick < interval:
+            self.stats.position_monitor_cycles_skipped_by_cadence += 1
+            return
+
+        # Advance the deadline before I/O so provider failures cannot turn the
+        # one-second processing loop back into an RPC retry loop.
+        self._last_position_update_monotonic = now_tick
+        self.stats.position_monitor_cycles += 1
+        self.stats.position_monitor_quote_attempts += open_positions
+        self.stats.position_monitor_peak_open_positions = max(
+            self.stats.position_monitor_peak_open_positions,
+            open_positions,
+        )
+
+        with self._helius_request_purpose("position_monitor"):
+            market_data = await self._fetch_market_data()
+        self.stats.position_monitor_quotes_received += len(market_data)
 
         if market_data:
             triggers = self.paper_adapter.update_positions(market_data)
 
             # Check for exits
             for mint, mint_triggers in triggers.items():
-                final_triggers = [t for t in mint_triggers if t in (
-                    "INITIAL_STOP", "TRAILING_STOP", "BREAKEVEN_STOP",
-                    "TIME_EXIT", "LIQUIDITY_EXIT", "SELL_PRESSURE_EXIT",
-                )]
+                final_triggers = [t for t in mint_triggers if t in {
+                    ExitTrigger.INITIAL_STOP,
+                    ExitTrigger.TRAILING_STOP,
+                    ExitTrigger.BREAKEVEN_STOP,
+                    ExitTrigger.TIME_EXIT,
+                    ExitTrigger.LIQUIDITY_EXIT,
+                    ExitTrigger.SELL_PRESSURE_EXIT,
+                }]
 
                 if final_triggers:
-                    # Position will be closed, stats updated in paper_adapter
                     self.stats.paper_exits += 1
-                    if mint in self.paper_adapter.positions:
-                        pos = self.paper_adapter.positions[mint]
-                        if pos.tokens_remaining == 0:
-                            self.stats.final_exits += 1
-                        else:
-                            self.stats.partial_exits += 1
+                    self.stats.final_exits += 1
+                elif ExitTrigger.TAKE_PROFIT in mint_triggers:
+                    self.stats.partial_exits += 1
 
     async def _fetch_market_data(self) -> Dict[str, Dict]:
         """Fetch current market data for open positions."""
@@ -981,7 +1084,12 @@ class Phase4BPipeline:
             conn = None
 
             # Get current price quote
-            quote = await self.helius_client.get_price(candidate.mint, side="sell", size_sol=0.02)
+            with self._helius_request_purpose("outcome_sampling"):
+                quote = await self.helius_client.get_price(
+                    candidate.mint,
+                    side="sell",
+                    size_sol=0.02,
+                )
             
             price_sol = quote.executable_price if quote else None
             executable_buy_price = None
@@ -996,7 +1104,12 @@ class Phase4BPipeline:
             # Get sell quote status
             sell_quote_available = None
             try:
-                sell_quote = await self.helius_client.get_sell_quote(candidate.mint, 1000.0, slippage_bps=50)
+                with self._helius_request_purpose("outcome_sampling"):
+                    sell_quote = await self.helius_client.get_sell_quote(
+                        candidate.mint,
+                        1000.0,
+                        slippage_bps=50,
+                    )
                 sell_quote_available = bool(sell_quote)
             except Exception as exc:
                 logger.debug("Sellability observation unavailable for %s: %s", candidate.mint, exc)

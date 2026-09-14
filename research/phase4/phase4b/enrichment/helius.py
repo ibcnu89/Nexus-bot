@@ -14,6 +14,8 @@ import logging
 import os
 import time
 from collections import OrderedDict
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal
 from enum import Enum
@@ -115,14 +117,17 @@ class CreditGovernor:
         monthly_credit_limit: int = 1_000_000,
         billing_cycle_start_day: int = 1,  # Day of month cycle starts
         safety_ceiling_pct: float = 70.0,  # 70% ceiling
+        projection_min_observation_seconds: float = 300.0,
     ):
         self.monthly_credit_limit = monthly_credit_limit
         self.billing_cycle_start_day = billing_cycle_start_day
         self.safety_ceiling_pct = safety_ceiling_pct
         self.safety_ceiling_credits = int(monthly_credit_limit * safety_ceiling_pct / 100)
+        self.projection_min_observation_seconds = projection_min_observation_seconds
         
         self._credits_used = 0
         self._cycle_start = self._calculate_cycle_start()
+        self._session_started_at = time.time()
         self._call_counts: Dict[str, int] = {}
         self._lock = __import__("threading").RLock()
         
@@ -166,25 +171,41 @@ class CreditGovernor:
         return credits
     
     def get_state(self) -> Dict[str, Any]:
-        """Get current governor state."""
+        """Get the session-scoped governor state.
+
+        Helius does not expose account-cycle usage through the RPC API.  This
+        process therefore cannot truthfully infer total billing-cycle usage
+        from its own counter.  The actionable projection is the measured
+        process-session run rate, once a minimum observation window has
+        elapsed.  Account-wide state remains explicitly UNKNOWN.
+        """
         with self._lock:
             now = time.time()
-            elapsed = now - self._cycle_start
-            cycle_duration = self._get_cycle_duration()
-            elapsed_fraction = min(elapsed / cycle_duration, 1.0) if cycle_duration > 0 else 0
-            
-            if elapsed_fraction > 0:
-                projected_monthly = self._credits_used / elapsed_fraction
-            else:
-                projected_monthly = self._credits_used * (30 * 86400 / max(elapsed, 1))
-            
-            projected_utilization_pct = (projected_monthly / self.monthly_credit_limit) * 100
-            
-            if projected_utilization_pct < 50:
+            session_elapsed = max(now - self._session_started_at, 0.0)
+            projection_ready = session_elapsed >= self.projection_min_observation_seconds
+            credits_per_second = self._credits_used / max(session_elapsed, 1.0)
+            projected_daily = credits_per_second * 86400
+            projected_monthly = projected_daily * 30
+            projected_utilization_pct = (
+                projected_monthly / self.monthly_credit_limit * 100
+                if self.monthly_credit_limit > 0
+                else float("inf")
+            )
+            absolute_utilization_pct = (
+                self._credits_used / self.monthly_credit_limit * 100
+                if self.monthly_credit_limit > 0
+                else float("inf")
+            )
+
+            if self._credits_used >= self.safety_ceiling_credits:
+                state = "HARD_STOP"
+            elif not projection_ready:
+                state = "WARMING_UP"
+            elif projected_utilization_pct < 50:
                 state = "NORMAL"
             elif projected_utilization_pct < 65:
                 state = "WARNING"
-            elif projected_utilization_pct < 70:
+            elif projected_utilization_pct < self.safety_ceiling_pct:
                 state = "THROTTLE"
             else:
                 state = "HARD_STOP"
@@ -192,11 +213,22 @@ class CreditGovernor:
             return {
                 "state": state,
                 "credits_used": self._credits_used,
+                "session_elapsed_seconds": round(session_elapsed, 1),
+                "session_credits_per_second": round(credits_per_second, 6),
+                "session_projected_daily_credits": int(projected_daily),
+                "session_projected_monthly_credits": int(projected_monthly),
+                # Transitional alias retained for existing callers.  Its basis
+                # is now the measured session rate, not incomplete cycle data.
                 "projected_monthly_credits": int(projected_monthly),
                 "projected_utilization_pct": round(projected_utilization_pct, 1),
+                "absolute_session_utilization_pct": round(absolute_utilization_pct, 3),
                 "safety_ceiling_credits": self.safety_ceiling_credits,
                 "safety_ceiling_pct": self.safety_ceiling_pct,
-                "elapsed_fraction": round(elapsed_fraction, 3),
+                "projection_ready": projection_ready,
+                "projection_min_observation_seconds": self.projection_min_observation_seconds,
+                "projection_basis": "process_session_run_rate_30_days",
+                "account_cycle_usage_complete": False,
+                "account_cycle_state": "UNKNOWN",
                 "call_counts": dict(self._call_counts),
             }
     
@@ -215,9 +247,11 @@ class CreditGovernor:
         if state_info["state"] == "THROTTLE":
             return False, f"Credit governor THROTTLE: only highest-score candidates allowed"
         
-        # Check if this specific operation would push us over
-        if state_info["projected_monthly_credits"] + estimated_credits > self.safety_ceiling_credits:
-            return False, f"Would exceed safety ceiling ({self.safety_ceiling_pct}%)"
+        # Before the projection is statistically usable, enforce the absolute
+        # process-session ceiling.  Once ready, THROTTLE/HARD_STOP above cover
+        # unsafe sustained rates.
+        if state_info["credits_used"] + estimated_credits > self.safety_ceiling_credits:
+            return False, f"Would exceed absolute session safety ceiling ({self.safety_ceiling_pct}%)"
         
         return True, "OK"
     
@@ -227,6 +261,7 @@ class CreditGovernor:
             self._credits_used = 0
             self._call_counts.clear()
             self._cycle_start = self._calculate_cycle_start()
+            self._session_started_at = time.time()
 
 
 class HeliusClient:
@@ -257,6 +292,10 @@ class HeliusClient:
         self._token_cache: Dict[str, Dict] = {}  # mint -> {decimals, supply, authorities}
         self._bonding_curve_accounts: Dict[str, tuple[str, int]] = {}
         self._last_bonding_curve_states: Dict[str, Any] = {}
+        self._request_purpose: ContextVar[str] = ContextVar(
+            f"helius_request_purpose_{id(self)}",
+            default="other",
+        )
         self._provider_metrics_started_at = time.time()
         self._provider_metrics = {
             "requests": 0,
@@ -268,6 +307,9 @@ class HeliusClient:
             "failed_calls": 0,
             "latencies_ms": [],
             "request_times": [],
+            "requests_by_purpose": {},
+            "successful_requests_by_purpose": {},
+            "credits_by_purpose": {},
         }
         # RPC method credit costs
         self.credit_costs = {
@@ -302,6 +344,16 @@ class HeliusClient:
         import hashlib
         key_str = f"{method}:{json.dumps(params, sort_keys=True)}"
         return hashlib.sha256(key_str.encode()).hexdigest()[:32]
+
+    @contextmanager
+    def request_purpose(self, purpose: str):
+        """Attribute Helius attempts and credits to one pipeline workstream."""
+        normalized = purpose.strip().lower() if purpose and purpose.strip() else "other"
+        token = self._request_purpose.set(normalized)
+        try:
+            yield
+        finally:
+            self._request_purpose.reset(token)
     
     async def _rpc_call(self, method: str, params: list) -> Optional[dict]:
         """Make RPC call with retry logic and credit tracking."""
@@ -328,9 +380,12 @@ class HeliusClient:
         }
         
         for attempt in range(self.max_retries):
+            purpose = self._request_purpose.get()
             if attempt > 0:
                 self._provider_metrics["retries"] += 1
             self._provider_metrics["requests"] += 1
+            requests_by_purpose = self._provider_metrics["requests_by_purpose"]
+            requests_by_purpose[purpose] = requests_by_purpose.get(purpose, 0) + 1
             self._provider_metrics["request_times"].append(time.time())
             request_started = time.perf_counter()
             try:
@@ -339,8 +394,12 @@ class HeliusClient:
                         data = await resp.json()
                         if "result" in data:
                             # Record credit usage
-                            self.governor.record_usage(method)
+                            credits = self.governor.record_usage(method)
                             self._provider_metrics["successful_requests"] += 1
+                            successful_by_purpose = self._provider_metrics["successful_requests_by_purpose"]
+                            successful_by_purpose[purpose] = successful_by_purpose.get(purpose, 0) + 1
+                            credits_by_purpose = self._provider_metrics["credits_by_purpose"]
+                            credits_by_purpose[purpose] = credits_by_purpose.get(purpose, 0) + credits
                             return data["result"]
                         elif "error" in data:
                             logger.warning(f"RPC error: {data['error']}")
@@ -397,6 +456,11 @@ class HeliusClient:
                 4,
             ),
             "peak_requests_per_second": max(request_buckets.values(), default=0),
+            "requests_by_purpose": dict(self._provider_metrics["requests_by_purpose"]),
+            "successful_requests_by_purpose": dict(
+                self._provider_metrics["successful_requests_by_purpose"]
+            ),
+            "credits_by_purpose": dict(self._provider_metrics["credits_by_purpose"]),
             "credits_used": governor["credits_used"],
             "governor_state": governor["state"],
             "governor": governor,

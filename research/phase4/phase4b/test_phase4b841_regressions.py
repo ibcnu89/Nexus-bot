@@ -332,7 +332,9 @@ def test_helius_rpc_metrics_measure_retry_rate_limit_and_success(monkeypatch):
     assert metrics["timeouts"] == 0
     assert metrics["failed_calls"] == 0
     assert metrics["credits_used"] == 1
-    assert metrics["governor_state"] == "NORMAL"
+    assert metrics["governor_state"] == "WARMING_UP"
+    assert metrics["governor"]["projection_ready"] is False
+    assert metrics["governor"]["account_cycle_state"] == "UNKNOWN"
     assert metrics["peak_requests_per_second"] == 2
 
 
